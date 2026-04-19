@@ -587,7 +587,11 @@ function Test-Seaworthy {
     }
 
     if ($bestGpu) {
-        $vramGB = if ($bestGpu.AdapterRAM) { [math]::Round($bestGpu.AdapterRAM / 1GB, 2) } else { $null }
+        # Prefer registry lookup (fixes 4GB WMI overflow), fall back to WMI
+        $vramGB = Get-GpuVramGB -GpuName $bestGpu.Name
+        if (-not $vramGB -and $bestGpu.AdapterRAM) {
+            $vramGB = [math]::Round($bestGpu.AdapterRAM / 1GB, 2)
+        }
         $vramDisplay = if ($vramGB) { "$vramGB GB VRAM" } else { 'VRAM unknown' }
         Write-Line ("GPU:     {0} ({1})" -f $bestGpu.Name, $vramDisplay)
 
@@ -630,7 +634,7 @@ function Test-Seaworthy {
     # --- Storage check ---
     Write-Line ''
     $targetDrive = $null
-    $installs = Find-WindroseInstall
+    $installs = @(Find-WindroseInstall)   # force array even if single result
     if ($installs -and $installs.Count -gt 0) {
         # Robustly extract a drive letter from the first install path. Guards
         # against any upstream weirdness with array shape or path concatenation.
@@ -915,7 +919,7 @@ function Find-WindroseInstall {
     # Cache the result - this function is called twice (once by Test-Seaworthy,
     # once by Get-GameVersionInfo) and they should always agree.
     if ($null -ne $script:WindroseInstallCache) {
-        return $script:WindroseInstallCache
+        return ,@($script:WindroseInstallCache)  # comma operator forces array wrap
     }
 
     $candidates = New-Object System.Collections.Generic.List[string]

@@ -5,6 +5,15 @@ All notable changes to Windrose Captain's Chest will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.5] - 2026-04-19
+
+Follow-ups from v1.0.4 testing.
+
+### Fixed
+
+- **Seaworthy GPU section still showed 4 GB VRAM** for large cards. The v1.0.1/1.0.4 `Get-GpuVramGB` function was implemented but the Seaworthy check wasn't actually using it — it was still reading WMI's overflowed `AdapterRAM` directly. Now calls the same registry lookup as the Crow's nest section.
+- **Storage check still defaulted to C:** even on systems where the Windrose install drive is correctly detected elsewhere in the report. Root cause: PowerShell's scalar-vs-array gotcha — when `Find-WindroseInstall` returned a single-element list, downstream code checked `.Count` which doesn't exist on a scalar string. Now wraps with `@(...)` and uses the comma operator in cache returns to guarantee array shape.
+
 ## [1.0.4] - 2026-04-19
 
 Multiple detection fixes — found while testing v1.0.3.
