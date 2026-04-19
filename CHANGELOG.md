@@ -5,6 +5,29 @@ All notable changes to Windrose Captain's Chest will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-04-19
+
+Major new feature: Fleet check for Windrose backend services.
+
+### Added
+
+- **Fleet check (Windrose backend service reachability).** A new section that runs in all three modes and diagnoses whether Windrose's own services are reachable from your machine. Checks four endpoints:
+  - `r5coopapigateway-eu-release.windrose.support` (EU/NA API gateway, port 443)
+  - `r5coopapigateway-ru-release.windrose.support` (CIS API gateway, port 443)
+  - `r5coopapigateway-sea-release.windrose.support` (SEA API gateway, port 443)
+  - `windrose.support:3478` (STUN/TURN for P2P signaling)
+- **Dual-DNS diagnosis.** Each domain is resolved via both system DNS and Google's 8.8.8.8, so the report can distinguish between ISP blocking, DNS spoofing, timeouts, IPv6-only results, and dev-side outages.
+- **Plain-English failure diagnosis with fix instructions** embedded in the report. If ISP blocking is detected, the report prints DNS switch instructions for Google/Cloudflare DNS and the exact wording to use when contacting the ISP. If DNS spoofing is detected (VPN / parental controls / NextDNS), the report explains that and offers the DNS switch. If IPv6-prioritization is detected, the report includes the registry command to force IPv4 preference.
+- **`-SkipServiceCheck` parameter** for users who want to skip the backend check entirely.
+
+### Background
+
+The Windrose devs have publicly acknowledged that some ISPs (particularly in EU and NA) are blocking their backend services, causing the game's "Connection Services" screen to show N/A for all regions. This check turns "I don't know why the game won't connect" into a specific diagnosis: ISP block, DNS spoofing, IPv6 bug, or genuine outage. Helpers on Discord can triage much faster with this info.
+
+### Changed
+
+- The wiki's Troubleshooting page will want an update to reference the Fleet check — any specific fix in the report output mirrors the fixes in the wiki.
+
 ## [1.0.5] - 2026-04-19
 
 Follow-ups from v1.0.4 testing.

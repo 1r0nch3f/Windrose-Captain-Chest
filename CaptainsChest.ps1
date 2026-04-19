@@ -9,6 +9,9 @@
       - Ship's papers:  OS, CPU, RAM, GPU (with driver age check)
       - Seaworthy:      Spec check vs Windrose min/recommended (CPU, RAM, GPU,
                         DirectX, disk space, SSD detection)
+      - Fleet check:    Windrose backend service reachability (DNS, STUN/TURN,
+                        regional API gateways) - diagnoses ISP blocking vs
+                        dev-side outages
       - Soundings:      Network adapters, local IP, public IP
       - Hold inventory: Windrose install detection and executable versions
       - Watch posts:    Firewall profile and Steam/Windrose rules
@@ -54,6 +57,9 @@
 .PARAMETER NoRedactPrompt
     Skip the "create redacted version?" prompt at the end (don't create one).
 
+.PARAMETER SkipServiceCheck
+    Skip the Windrose backend service reachability check.
+
 .EXAMPLE
     .\CaptainsChest.ps1
     .\CaptainsChest.ps1 -ServerIP 1.2.3.4 -ServerPort 7777 -Mode Full -NoPause
@@ -70,7 +76,8 @@ param(
     [switch]$SkipNetworkTests,
     [switch]$NoPause,
     [switch]$Redact,
-    [switch]$NoRedactPrompt
+    [switch]$NoRedactPrompt,
+    [switch]$SkipServiceCheck
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -82,6 +89,38 @@ $script:WindrosePortPresets = @(
     [pscustomobject]@{ Port = 7778;  Protocol = 'UDP';     Purpose = 'Secondary game port' }
     [pscustomobject]@{ Port = 27015; Protocol = 'UDP/TCP'; Purpose = 'Steam query / master' }
     [pscustomobject]@{ Port = 27036; Protocol = 'UDP/TCP'; Purpose = 'Steam streaming / P2P' }
+)
+
+# --- Windrose backend service endpoints (edit here if they move) ---------------
+# Source: the game's own config and Kraken Express's public statements. These
+# are the services the game's "Connection Services" screen checks. If these
+# show N/A in-game, these checks will tell you whether it's ISP blocking or
+# a genuine backend outage.
+$script:WindroseServiceEndpoints = @(
+    [pscustomobject]@{
+        Name   = 'EU/NA API Gateway'
+        Host   = 'r5coopapigateway-eu-release.windrose.support'
+        Port   = 443
+        Region = 'EU & NA'
+    }
+    [pscustomobject]@{
+        Name   = 'RU/CIS API Gateway'
+        Host   = 'r5coopapigateway-ru-release.windrose.support'
+        Port   = 443
+        Region = 'CIS'
+    }
+    [pscustomobject]@{
+        Name   = 'SEA API Gateway'
+        Host   = 'r5coopapigateway-sea-release.windrose.support'
+        Port   = 443
+        Region = 'SEA'
+    }
+    [pscustomobject]@{
+        Name   = 'STUN/TURN (P2P signaling)'
+        Host   = 'windrose.support'
+        Port   = 3478
+        Region = 'Global'
+    }
 )
 
 # --- Windrose system requirements (edit if the game updates these) -------------
@@ -829,6 +868,254 @@ function Get-BaselineConnectivity {
 }
 
 # -------------------------------------------------------------------------------
+# Fleet check - Windrose backend service reachability
+# -------------------------------------------------------------------------------
+# Diagnoses whether "N/A" status in the game's Connection Services screen is:
+#   - ISP blocking (DNS returns NXDOMAIN or 127.0.0.1)
+#   - Firewall/AV blocking (DNS timeouts)
+#   - IPv6 preference bug (IPv6 result returned, game is IPv4 only)
+#   - Genuine dev-side outage (all DNS fine but TCP fails)
+#   - User's network totally fine (all reachable - issue is elsewhere)
+# -------------------------------------------------------------------------------
+
+function Resolve-HostDnsDiagnostic {
+    <#
+        Tries to resolve a hostname via BOTH system DNS and Google's 8.8.8.8.
+        Returns a diagnostic object describing what happened - this is the core
+        of the "is your ISP blocking Windrose?" check, straight out of the
+        game's official FAQ.
+    #>
+    param([string]$HostName)
+
+    $result = [pscustomobject]@{
+        HostName        = $HostName
+        SystemStatus    = 'Unknown'  # OK | NXDOMAIN | Timeout | Spoofed | IPv6Only
+        SystemAddresses = @()
+        PublicStatus    = 'Unknown'
+        PublicAddresses = @()
+        Diagnosis       = ''
+    }
+
+    # --- System DNS lookup ---
+    try {
+        $sys = Resolve-DnsName -Name $HostName -Type A -QuickTimeout -ErrorAction Stop
+        $ipv4 = @($sys | Where-Object { $_.Type -eq 'A'    -and $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique)
+        $ipv6 = @($sys | Where-Object { $_.Type -eq 'AAAA' -and $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique)
+
+        if ($ipv4) {
+            $result.SystemAddresses = $ipv4
+            if ($ipv4 -contains '127.0.0.1' -or $ipv4 -contains '0.0.0.0') {
+                $result.SystemStatus = 'Spoofed'
+            } else {
+                $result.SystemStatus = 'OK'
+            }
+        } elseif ($ipv6) {
+            $result.SystemAddresses = $ipv6
+            $result.SystemStatus = 'IPv6Only'
+        } else {
+            $result.SystemStatus = 'NXDOMAIN'
+        }
+    } catch {
+        $msg = $_.Exception.Message
+        if ($msg -match 'does not exist|NXDOMAIN|Non-existent') {
+            $result.SystemStatus = 'NXDOMAIN'
+        } elseif ($msg -match 'timeout|timed out') {
+            $result.SystemStatus = 'Timeout'
+        } else {
+            $result.SystemStatus = 'NXDOMAIN'  # default for any failure
+        }
+    }
+
+    # --- Google public DNS lookup (bypasses ISP DNS) ---
+    try {
+        $pub = Resolve-DnsName -Name $HostName -Type A -Server '8.8.8.8' -QuickTimeout -ErrorAction Stop
+        $ipv4 = @($pub | Where-Object { $_.Type -eq 'A' -and $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique)
+        if ($ipv4) {
+            $result.PublicAddresses = $ipv4
+            $result.PublicStatus = 'OK'
+        } else {
+            $result.PublicStatus = 'NXDOMAIN'
+        }
+    } catch {
+        if ($_.Exception.Message -match 'timeout|timed out') {
+            $result.PublicStatus = 'Timeout'
+        } else {
+            $result.PublicStatus = 'NXDOMAIN'
+        }
+    }
+
+    # --- Diagnose ---
+    if ($result.SystemStatus -eq 'OK') {
+        $result.Diagnosis = 'DNS resolves normally.'
+    } elseif ($result.SystemStatus -eq 'NXDOMAIN' -and $result.PublicStatus -eq 'OK') {
+        $result.Diagnosis = 'ISP BLOCK: Your ISP/router is blocking this domain. It resolves fine on Google DNS (8.8.8.8) but not on your system DNS. See Troubleshooting section for DNS switch instructions.'
+    } elseif ($result.SystemStatus -eq 'NXDOMAIN' -and $result.PublicStatus -eq 'NXDOMAIN') {
+        $result.Diagnosis = 'DOMAIN DOWN: The domain does not resolve anywhere. This may be a dev-side issue (Windrose services genuinely down) or the domain has been retired.'
+    } elseif ($result.SystemStatus -eq 'Spoofed') {
+        $result.Diagnosis = 'DNS SPOOFING: Your DNS is returning a loopback/null address. Your ISP, parental controls, VPN, or custom DNS provider (e.g. NextDNS) is intercepting this domain.'
+    } elseif ($result.SystemStatus -eq 'IPv6Only') {
+        $result.Diagnosis = 'IPv6 ONLY: Only an IPv6 address was returned. Windrose does NOT support IPv6 - you need to prioritize IPv4 (see Troubleshooting section).'
+    } elseif ($result.SystemStatus -eq 'Timeout') {
+        $result.Diagnosis = 'DNS TIMEOUT: Your DNS server did not respond. Check firewall/antivirus, or try switching to Google DNS (8.8.8.8 / 8.8.4.4).'
+    } else {
+        $result.Diagnosis = 'DNS resolution unclear.'
+    }
+
+    return $result
+}
+
+function Test-WindroseServices {
+    if ($SkipServiceCheck) { return }
+    if ($SkipNetworkTests) {
+        Write-Section 'Fleet check (Windrose services)'
+        Write-Line 'Skipped (-SkipNetworkTests flag).'
+        return
+    }
+
+    Write-Section 'Fleet check (Windrose services)'
+    Write-Line 'Checking whether Windrose backend services are reachable from this'
+    Write-Line 'machine. If the game shows "N/A" for Connection Services, this tells'
+    Write-Line 'you whether it is ISP blocking, DNS issues, or a genuine outage.'
+    Write-Line ''
+
+    $anyIspBlock  = $false
+    $anyDnsSpoof  = $false
+    $anyIpv6Issue = $false
+    $reachable    = 0
+    $unreachable  = 0
+    $dnsIssues    = @()
+
+    foreach ($endpoint in $script:WindroseServiceEndpoints) {
+        Write-Line ("--- {0} ({1}) ---" -f $endpoint.Name, $endpoint.Region)
+
+        # DNS diagnosis
+        $dns = Resolve-HostDnsDiagnostic -HostName $endpoint.Host
+        Write-Line ("Host:         {0}" -f $endpoint.Host)
+        Write-Line ("System DNS:   {0}{1}" -f $dns.SystemStatus, $(if ($dns.SystemAddresses) { ' -> ' + ($dns.SystemAddresses -join ', ') } else { '' }))
+        Write-Line ("Google DNS:   {0}{1}" -f $dns.PublicStatus, $(if ($dns.PublicAddresses) { ' -> ' + ($dns.PublicAddresses -join ', ') } else { '' }))
+
+        if ($dns.Diagnosis) {
+            Write-Line ("Diagnosis:    {0}" -f $dns.Diagnosis)
+        }
+
+        if ($dns.SystemStatus -eq 'NXDOMAIN' -and $dns.PublicStatus -eq 'OK') {
+            $anyIspBlock = $true
+            $dnsIssues += "$($endpoint.Host): ISP blocking"
+        }
+        if ($dns.SystemStatus -eq 'Spoofed') {
+            $anyDnsSpoof = $true
+            $dnsIssues += "$($endpoint.Host): DNS spoofing"
+        }
+        if ($dns.SystemStatus -eq 'IPv6Only') {
+            $anyIpv6Issue = $true
+            $dnsIssues += "$($endpoint.Host): IPv6-only (game needs IPv4)"
+        }
+
+        # TCP connectivity test - only meaningful if we got a real address
+        if ($dns.SystemStatus -eq 'OK' -and $dns.SystemAddresses) {
+            try {
+                $tcp = Test-NetConnection -ComputerName $endpoint.Host -Port $endpoint.Port -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
+                if ($tcp.TcpTestSucceeded) {
+                    Write-Line ("TCP {0,-5}:   REACHABLE" -f $endpoint.Port)
+                    $reachable++
+                    Add-Finding -Status 'PASS' -Check "Fleet: $($endpoint.Name)" -Details "Reachable on $($endpoint.Host):$($endpoint.Port)."
+                } else {
+                    Write-Line ("TCP {0,-5}:   BLOCKED or DOWN" -f $endpoint.Port)
+                    $unreachable++
+                    Add-Finding -Status 'FAIL' -Check "Fleet: $($endpoint.Name)" -Details "TCP $($endpoint.Port) unreachable on $($endpoint.Host). DNS resolved but connection refused/filtered."
+                }
+            } catch {
+                Write-Line ("TCP {0,-5}:   ERROR - {1}" -f $endpoint.Port, $_.Exception.Message)
+                $unreachable++
+            }
+        } else {
+            Write-Line ("TCP {0,-5}:   skipped (DNS failed)" -f $endpoint.Port)
+            $unreachable++
+            Add-Finding -Status 'FAIL' -Check "Fleet: $($endpoint.Name)" -Details "$($endpoint.Host) could not be resolved via system DNS. See Fleet check section for diagnosis."
+        }
+
+        Write-Line ''
+    }
+
+    # ============== Overall summary with fix suggestions ==============
+    Write-Section 'Fleet check summary'
+    Write-Line ("Reachable endpoints:    {0} of {1}" -f $reachable, $script:WindroseServiceEndpoints.Count)
+    Write-Line ("Unreachable endpoints:  {0}" -f $unreachable)
+    Write-Line ''
+
+    if ($reachable -eq $script:WindroseServiceEndpoints.Count) {
+        Write-Line 'GOOD NEWS: All Windrose services are reachable from your machine.'
+        Write-Line 'If the game still shows "N/A" for Connection Services, try restarting'
+        Write-Line 'the game and Steam. If the problem persists, it is likely dev-side.'
+        Add-Finding -Status 'PASS' -Check 'Fleet: Overall' -Details "All $reachable Windrose service endpoints reachable."
+    } elseif ($anyDnsSpoof) {
+        Write-Line '*** DNS SPOOFING DETECTED ***'
+        Write-Line ''
+        Write-Line 'Your system DNS is returning fake answers for Windrose domains. This is'
+        Write-Line 'almost always caused by:'
+        Write-Line '  - A VPN or proxy that hijacks DNS (disconnect it and try again)'
+        Write-Line '  - Parental control software or network-level content filters'
+        Write-Line '  - A custom DNS provider that blocks gaming endpoints (e.g. NextDNS with'
+        Write-Line '    aggressive filtering, some ISP "safe browsing" features)'
+        Write-Line ''
+        Write-Line 'FIX: Switch to Google DNS (8.8.8.8 / 8.8.4.4) or Cloudflare (1.1.1.1):'
+        Write-Line '  1. Settings > Network & Internet > your active connection > Properties'
+        Write-Line '  2. Edit DNS server assignment > Manual > IPv4 ON'
+        Write-Line '     Preferred: 8.8.8.8   Alternate: 8.8.4.4'
+        Write-Line '  3. Save, then run: ipconfig /flushdns'
+        Add-Finding -Status 'FAIL' -Check 'Fleet: Overall' -Details "DNS spoofing detected. See Fleet check section for fix."
+    } elseif ($anyIspBlock) {
+        Write-Line '*** ISP / NETWORK BLOCKING DETECTED ***'
+        Write-Line ''
+        Write-Line 'Your ISP or router is preventing your system from resolving Windrose'
+        Write-Line 'endpoints. Google DNS can resolve them fine, but your system DNS cannot.'
+        Write-Line 'The devs have publicly acknowledged that some ISPs are blocking their'
+        Write-Line 'backend (particularly in EU and NA).'
+        Write-Line ''
+        Write-Line 'FIXES, in order of ease:'
+        Write-Line '  1. Switch to Google DNS (8.8.8.8 / 8.8.4.4) - see instructions above'
+        Write-Line '  2. Try a VPN - if it works with a VPN, confirmed ISP block'
+        Write-Line '  3. Contact your ISP and ask them to whitelist:'
+        Write-Line '       Domain:    *.windrose.support (all subdomains)'
+        Write-Line '       Port:      3478'
+        Write-Line '       Protocols: UDP and TCP'
+        Write-Line '       Reason:    STUN/TURN for a legitimate game application'
+        Write-Line ''
+        Write-Line '  ISPs known to block Windrose: Ziggo (NL), and various others in EU/NA.'
+        Write-Line '  NextDNS with default filtering also blocks by default.'
+        Add-Finding -Status 'FAIL' -Check 'Fleet: Overall' -Details "ISP blocking detected on $($dnsIssues.Count) endpoint(s). See Fleet check section for fixes."
+    } elseif ($anyIpv6Issue) {
+        Write-Line '*** IPv6 PRIORITIZATION ISSUE ***'
+        Write-Line ''
+        Write-Line 'Your system prefers IPv6 for Windrose domains, but the game is IPv4-only.'
+        Write-Line 'This causes silent connection failures.'
+        Write-Line ''
+        Write-Line 'FIX: Keep IPv6 enabled but force Windows to prefer IPv4. Open an elevated'
+        Write-Line 'Command Prompt and run:'
+        Write-Line ''
+        Write-Line '  reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters"'
+        Write-Line '    /v DisabledComponents /t REG_DWORD /d 32 /f'
+        Write-Line ''
+        Write-Line 'Then restart the PC. To revert later, set /d 0 instead of /d 32.'
+        Add-Finding -Status 'FAIL' -Check 'Fleet: Overall' -Details "IPv6 prioritization issue. Game is IPv4-only. See Fleet check section for fix."
+    } elseif ($reachable -gt 0 -and $unreachable -gt 0) {
+        Write-Line 'PARTIAL OUTAGE: Some Windrose services are reachable, others are not.'
+        Write-Line 'This usually means a regional backend is down rather than your network.'
+        Write-Line 'Check playwindrose.com or the #status channel in the official Discord'
+        Write-Line 'for announcements. Consider waiting and trying again in a few hours.'
+        Add-Finding -Status 'WARN' -Check 'Fleet: Overall' -Details "Partial outage: $reachable reachable, $unreachable unreachable. Likely a regional backend issue."
+    } else {
+        Write-Line 'All Windrose endpoints are unreachable. This can indicate:'
+        Write-Line '  - The Windrose backend is entirely down (dev-side)'
+        Write-Line '  - Your internet connection is broken (but other sites would also fail)'
+        Write-Line '  - Your firewall is blocking ALL outbound HTTPS on port 443'
+        Write-Line ''
+        Write-Line 'Check playwindrose.com and the official Discord for outage announcements.'
+        Add-Finding -Status 'FAIL' -Check 'Fleet: Overall' -Details "All $($script:WindroseServiceEndpoints.Count) Windrose services unreachable."
+    }
+}
+
+# -------------------------------------------------------------------------------
 # Hold inventory / watch posts / crew
 # -------------------------------------------------------------------------------
 
@@ -1405,6 +1692,8 @@ Run-CommandCapture -Label 'IP configuration' -Command { ipconfig /all }
 Run-CommandCapture -Label 'Route table'      -Command { route print }
 
 Get-PublicIP
+
+Test-WindroseServices
 
 Check-SteamAndProcesses
 $installs = Get-GameVersionInfo
