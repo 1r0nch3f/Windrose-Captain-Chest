@@ -5,6 +5,21 @@ All notable changes to Windrose Captain's Chest will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.4] - 2026-04-19
+
+Multiple detection fixes — found while testing v1.0.3.
+
+### Fixed
+
+- **Drive-scan fallback wasn't finding custom Steam libraries.** The array initializer in `Get-SteamLibraries` used comma-separated `Join-Path` calls which PowerShell parsed as one big argument list to the first `Join-Path` instead of four separate expressions. Result: `Test-Path` was called on garbage paths and always returned false. On systems where Steam's own `libraryfolders.vdf` didn't include all libraries (or where the registry lookup failed), this meant no libraries were found at all. Fixed by wrapping each `Join-Path` in parentheses.
+- **Storage check was checking C: instead of the Windrose install drive.** Side-effect of the above — since the first call to `Find-WindroseInstall` in `Test-Seaworthy` found no installs, the storage check defaulted to C:. With this fix, the storage check now checks the drive Windrose is actually installed on.
+- **GPU VRAM still showing 4GB on large cards.** The v1.0.1 registry fallback was looking in the wrong registry location (`HKLM:\SOFTWARE\Microsoft\DirectX` doesn't have the data on most Windows versions). Now checks three locations in order: `HKLM:\SYSTEM\CurrentControlSet\Control\Video\{GUID}\000X\HardwareInformation.qwMemorySize` (primary), the older DirectX path (fallback), and finally detects UInt32 overflow as a last-resort sentinel.
+
+### Changed
+
+- `Get-SteamLibraries` now uses `System.Collections.Generic.List[string]` instead of raw PowerShell arrays for more predictable behavior.
+- `Find-WindroseInstall` result is now cached within a single run so both `Test-Seaworthy` and `Get-GameVersionInfo` always agree.
+
 ## [1.0.3] - 2026-04-19
 
 Fix bugs introduced by the install-detection changes in v1.0.1.

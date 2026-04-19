@@ -349,7 +349,38 @@ function Get-GpuVramGB {
 
     # Win32_VideoController.AdapterRAM is a UInt32 that overflows at 4GB - any
     # GPU with more VRAM than that will report 4 (or a bogus smaller number).
-    # The registry under DirectX has the right value in QWORD form.
+    # Try multiple registry locations where Windows stores the real value as
+    # a 64-bit QWORD.
+
+    # Method 1: HKLM\SYSTEM\CurrentControlSet\Control\Video - most reliable,
+    # stores HardwareInformation.qwMemorySize as QWORD for each adapter.
+    try {
+        $videoRoot = 'HKLM:\SYSTEM\CurrentControlSet\Control\Video'
+        if (Test-Path $videoRoot) {
+            $guidFolders = Get-ChildItem $videoRoot -ErrorAction SilentlyContinue |
+                Where-Object { $_.PSChildName -match '^\{[0-9A-Fa-f\-]+\}$' }
+            foreach ($guid in $guidFolders) {
+                # Each adapter has 0000, 0001, etc. subkeys
+                $subkeys = Get-ChildItem $guid.PSPath -ErrorAction SilentlyContinue |
+                    Where-Object { $_.PSChildName -match '^\d{4}$' }
+                foreach ($sub in $subkeys) {
+                    $props = Get-ItemProperty $sub.PSPath -ErrorAction SilentlyContinue
+                    # Match on DriverDesc which holds the display name
+                    $desc = $props.'DriverDesc'
+                    if (-not $desc) { $desc = $props.'Device Description' }
+                    if ($desc -and $GpuName -and ($desc -eq $GpuName -or $GpuName -like "*$desc*" -or $desc -like "*$GpuName*")) {
+                        $qword = $props.'HardwareInformation.qwMemorySize'
+                        if (-not $qword) { $qword = $props.'HardwareInformation.MemorySize' }
+                        if ($qword -and $qword -gt 0) {
+                            return [math]::Round($qword / 1GB, 1)
+                        }
+                    }
+                }
+            }
+        }
+    } catch { }
+
+    # Method 2: HKLM\SOFTWARE\Microsoft\DirectX - newer Windows versions
     try {
         $regPath = 'HKLM:\SOFTWARE\Microsoft\DirectX'
         if (Test-Path $regPath) {
@@ -364,6 +395,23 @@ function Get-GpuVramGB {
             }
         }
     } catch { }
+
+    # Method 3: WMI Win32_VideoController but re-read AdapterRAM as an UInt32
+    # overflow hint — if it reports exactly 4294967295 or 4294836224 or a
+    # similar near-4GB value, we know the card is >=4GB but can't tell how much
+    try {
+        $gpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -eq $GpuName } | Select-Object -First 1
+        if ($gpu -and $gpu.AdapterRAM) {
+            $bytes = [uint64]$gpu.AdapterRAM
+            # If it's within 64 MB of the 4GB UInt32 cap, it's definitely overflowed
+            if ($bytes -ge 4227858432) {
+                return 4  # sentinel - caller can treat as "at least 4, real value unknown"
+            }
+            return [math]::Round($bytes / 1GB, 2)
+        }
+    } catch { }
+
     return $null
 }
 
@@ -813,54 +861,63 @@ function Get-WindrosePaths {
 }
 
 function Get-SteamLibraries {
-    $libs = @()
+    $libs = New-Object System.Collections.Generic.List[string]
 
     # Build list of libraryfolders.vdf candidates - registry path plus legacy defaults
-    $vdfCandidates = @(
-        "$env:ProgramFiles(x86)\Steam\steamapps\libraryfolders.vdf",
-        "$env:ProgramFiles\Steam\steamapps\libraryfolders.vdf",
-        "C:\Steam\steamapps\libraryfolders.vdf"
-    )
+    $vdfCandidates = New-Object System.Collections.Generic.List[string]
+    [void]$vdfCandidates.Add("$env:ProgramFiles(x86)\Steam\steamapps\libraryfolders.vdf")
+    [void]$vdfCandidates.Add("$env:ProgramFiles\Steam\steamapps\libraryfolders.vdf")
+    [void]$vdfCandidates.Add("C:\Steam\steamapps\libraryfolders.vdf")
 
     $steamRoot = Get-SteamInstallPath
     if ($steamRoot) {
-        $vdfCandidates += (Join-Path $steamRoot 'steamapps\libraryfolders.vdf')
-        $libs += $steamRoot
+        [void]$vdfCandidates.Add((Join-Path $steamRoot 'steamapps\libraryfolders.vdf'))
+        [void]$libs.Add($steamRoot)
     }
 
     foreach ($vdf in ($vdfCandidates | Select-Object -Unique)) {
         if (Test-Path $vdf) {
-            $content = Get-Content $vdf -Raw
-            $ms = [regex]::Matches($content, '"path"\s+"([^"]+)"')
-            foreach ($m in $ms) {
-                $libs += ($m.Groups[1].Value -replace '\\\\', '\')
-            }
+            try {
+                $content = Get-Content $vdf -Raw -ErrorAction Stop
+                $ms = [regex]::Matches($content, '"path"\s+"([^"]+)"')
+                foreach ($m in $ms) {
+                    [void]$libs.Add(($m.Groups[1].Value -replace '\\\\', '\'))
+                }
+            } catch { }
         }
     }
 
-    # Brute-force scan fixed drives for *SteamLibrary* and *SteamLibraries*
-    # folders. Catches the common case where users put a library on another
-    # drive without Steam's own config catching up.
+    # Brute-force scan fixed drives for common Steam library folder names.
+    # Catches the case where Steam's own config doesn't list the library
+    # (e.g. manually created libraries).
     try {
         $drives = Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue |
             Where-Object { $_.Free -gt 0 -and $_.Root -match '^[A-Z]:\\$' }
         foreach ($d in $drives) {
-            $candidates = @(
-                Join-Path $d.Root 'SteamLibrary',
-                Join-Path $d.Root 'Steam',
-                Join-Path $d.Root 'Games\SteamLibrary',
-                Join-Path $d.Root 'Games\Steam'
+            $driveCandidates = @(
+                (Join-Path $d.Root 'SteamLibrary')
+                (Join-Path $d.Root 'Steam')
+                (Join-Path $d.Root 'Games\SteamLibrary')
+                (Join-Path $d.Root 'Games\Steam')
             )
-            foreach ($c in $candidates) {
-                if (Test-Path $c) { $libs += $c }
+            foreach ($c in $driveCandidates) {
+                if (Test-Path $c) { [void]$libs.Add($c) }
             }
         }
     } catch { }
 
-    return $libs | Select-Object -Unique
+    return ($libs | Select-Object -Unique)
 }
 
+$script:WindroseInstallCache = $null
+
 function Find-WindroseInstall {
+    # Cache the result - this function is called twice (once by Test-Seaworthy,
+    # once by Get-GameVersionInfo) and they should always agree.
+    if ($null -ne $script:WindroseInstallCache) {
+        return $script:WindroseInstallCache
+    }
+
     $candidates = New-Object System.Collections.Generic.List[string]
 
     # Helper: add a path to the list, normalizing it first. Skips empty/bogus entries.
@@ -920,7 +977,9 @@ function Find-WindroseInstall {
     }
 
     # Return as a plain string array, force single-item arrays to stay arrays
-    return @($unique.ToArray())
+    $result = @($unique.ToArray())
+    $script:WindroseInstallCache = $result
+    return $result
 }
 
 function Copy-IfExists {
