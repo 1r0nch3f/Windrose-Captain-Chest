@@ -5,6 +5,19 @@ All notable changes to Windrose Captain's Chest will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-04-19
+
+Direct IP fallback note added to Fleet check summary.
+
+### Added
+
+- **Direct IP fallback note** in Fleet check summary. When Connection Services are unreachable, the report now points users to Windrose's Direct IP host mode on port 7777 as an immediate workaround.
+- **Clear trigger points for the fallback.** The note appears in the failure paths where backend reachability is broken or unusable, so users get a practical path forward instead of only ISP / DNS guidance.
+
+### Why
+
+Windrose's Direct IP mode bypasses the backend Connection Services path entirely. Since Captain's Chest already tests port 7777 in its default port presets, the report can safely tell users when this workaround is viable.
+
 ## [1.3.0] - 2026-04-19
 
 Automatic ISP detection and named-culprit diagnosis.

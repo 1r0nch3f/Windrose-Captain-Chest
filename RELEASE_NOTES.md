@@ -1,58 +1,36 @@
-# 🏴‍☠️ Windrose Captain's Chest v1.3.0
+# 🏴‍☠️ Windrose Captain's Chest v1.3.1
 
-**The big one.** Bundles the Fleet check feature (v1.1.0–v1.2.0) with the new ISP auto-detection and named-culprit diagnosis. If Windrose won't connect, this release tells you *exactly* which setting on *your specific ISP* to change.
+**Small but useful follow-up.** Adds a Direct IP fallback note to the Fleet check summary so users have an immediate workaround when Windrose Connection Services are unreachable.
 
-## 🆕 What's new in v1.3.0
+## 🆕 What's new in v1.3.1
 
-### Port authority — ISP auto-detection
+### Direct IP fallback in Fleet check summary
 
-A new report section identifies your ISP from your public IP and — if they're on the known-culprit list — tells you the exact router security feature to toggle off. No more Googling, no more guessing.
+When the backend path is down or unusable, the report now tells users to switch to Windrose's built-in Direct IP host mode instead of stopping at ISP or DNS guidance.
 
-Example output if you're on Spectrum:
+Example report text:
 
 ```
-=== Port authority (your ISP) ===
-ISP:      AS20115 Spectrum
-ASN:      AS20115
-City:     Dalton
-Country:  US
+=== Fallback: Direct IP mode ===
 
-*** HEADS UP: your ISP ships routers with a security feature that ***
-*** commonly blocks legitimate gaming traffic, including Windrose. ***
+Connection Services unreachable? You can host without them.
 
-ISP:              Spectrum (Charter)
-Feature to check: Security Shield
-Where to toggle:  My Spectrum app > Internet > Security Shield > OFF
+Host a Game -> Direct IP tab -> port 7777
+Share your public IP with your crew
 
-** This ISP has been CONFIRMED to block Windrose specifically. **
-Turning this feature off has fixed the issue for other players on
-this same ISP.
+This bypasses Windrose Connection Services entirely.
+Requires port 7777 to be open on your router (tested above).
 ```
 
-### 25+ named ISPs with specific fix instructions
+### Why this belongs in the tool
 
-| Region | Covered ISPs |
-|--------|-------------|
-| 🇺🇸 US | Spectrum, Xfinity, Cox, AT&T, CenturyLink/Lumen, Verizon, T-Mobile Home, Optimum, Frontier |
-| 🇬🇧 UK | BT, Sky, Virgin Media, TalkTalk |
-| 🇪🇺 EU | Ziggo (NL), Orange (FR), Free (FR), Deutsche Telekom, Vodafone |
-| 🇨🇦 CA | Rogers, Bell, Telus |
-| 🇦🇺 AU | Telstra, Optus |
-
-Each entry includes the specific "security feature" name and step-by-step toggle instructions.
-
-### Everything from v1.1.0 and v1.2.0 — Fleet check
-
-If you're installing fresh, you also get:
-
-- **Fleet check** — probes 8 Windrose backend endpoints (all three regional gateways + failovers + sentry + STUN/TURN) and diagnoses whether issues are ISP blocking, DNS spoofing, IPv6 prioritization, dev-side outages, or just you
-- **Dual-DNS diagnosis** — each endpoint resolved via both system DNS and Google 8.8.8.8 so the tool can distinguish ISP block from genuine outage
-- **Inline fix instructions** — DNS switch commands, ISP whitelist template, IPv6-to-IPv4 registry command, all printed in the report
-- **"EU & NA shared gateway" clarification** — the game's in-game list combines EU and NA for a reason; there's no separate NA endpoint
+- Captain's Chest already tests port **7777** in its default presets
+- Direct IP mode bypasses the Windrose backend path entirely
+- Users with ISP-level filtering now get a practical workaround in the report itself
 
 ## 📥 Quick start
 
-1. Download **CaptainsChest-v1.3.0.zip** below
+1. Download **CaptainsChest-v1.3.1.zip** below
 2. Extract anywhere
 3. Double-click `CaptainsChest.exe` — SmartScreen "More info" → "Run anyway", then UAC → Yes
 4. Pick any mode — Fleet check and ISP detection run in all three

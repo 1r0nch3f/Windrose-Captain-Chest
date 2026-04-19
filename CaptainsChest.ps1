@@ -1197,6 +1197,19 @@ function Show-KnownIspTable {
     Write-Line 'residential end, not on the host or Windrose''s side.'
 }
 
+
+function Write-DirectIpFallback {
+    Write-Line '=== Fallback: Direct IP mode ==='
+    Write-Line ''
+    Write-Line 'Connection Services unreachable? You can host without them.'
+    Write-Line ''
+    Write-Line 'Host a Game -> Direct IP tab -> port 7777'
+    Write-Line 'Share your public IP with your crew'
+    Write-Line ''
+    Write-Line 'This bypasses Windrose Connection Services entirely.'
+    Write-Line 'Requires port 7777 to be open on your router (tested above).'
+}
+
 function Test-WindroseServices {
     if ($SkipServiceCheck) { return }
     if ($SkipNetworkTests) {
@@ -1412,6 +1425,8 @@ function Test-WindroseServices {
         Write-Line 'Dedicated-server hosts (SurvivalServers, LOW.MS, g-portal) do NOT have this'
         Write-Line 'problem because they run on business connections without consumer filters.'
         Write-Line 'The block is on your residential ISP side, not Windrose''s or the host''s.'
+        Write-Line ''
+        Write-DirectIpFallback
 
         $details = if ($detectedCulprit) {
             "Partial outage: $reachable reachable, $unreachable unreachable. Recommended fix: toggle off $($detectedCulprit.Feature) on $($detectedCulprit.Name)."
@@ -1426,6 +1441,8 @@ function Test-WindroseServices {
         Write-Line '  - Your firewall is blocking ALL outbound HTTPS on port 443'
         Write-Line ''
         Write-Line 'Check playwindrose.com and the official Discord for outage announcements.'
+        Write-Line ''
+        Write-DirectIpFallback
         Add-Finding -Status 'FAIL' -Check 'Fleet: Overall' -Details "All $($script:WindroseServiceEndpoints.Count) Windrose services unreachable."
     }
 

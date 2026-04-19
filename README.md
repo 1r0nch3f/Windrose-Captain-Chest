@@ -180,12 +180,24 @@ Tested by default whenever you supply a target. Edit the `$script:WindrosePortPr
 
 | Port | Protocol | Purpose |
 |---|---|---|
-| 7777 | UDP/TCP | Default game port |
+| 7777 | UDP/TCP | Default game port and Direct IP host mode |
 | 7778 | UDP | Secondary game port |
 | 27015 | UDP/TCP | Steam query / master |
 | 27036 | UDP/TCP | Steam streaming / P2P |
 
 ---
+
+## 🆘 Direct IP fallback
+
+If Fleet check shows Connection Services are unreachable, Windrose can still be hosted through **Direct IP** mode instead of the backend service path. The report now prints this as a fallback when the backend is fully unreachable or when partial reachability points to 3478 / ISP-side Connection Services trouble.
+
+Use this path in game:
+
+```
+Host a Game -> Direct IP tab -> port 7777
+```
+
+Then share your public IP with your crew. This bypasses Windrose Connection Services entirely, but it still requires **port 7777** to be open on your router.
 
 ## 📋 Windrose system requirements (what Seaworthy checks against)
 
