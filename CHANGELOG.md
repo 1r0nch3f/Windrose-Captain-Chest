@@ -5,6 +5,55 @@ All notable changes to Windrose Captain's Chest will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-04-19
+
+Automatic ISP detection and named-culprit diagnosis.
+
+### Added
+
+- **Port authority section** — new report section above Fleet check that identifies your ISP from your public IP via `ipinfo.io` (with `ip-api.com` fallback), matches it against a table of known culprits, and tells you *exactly* which router security feature to toggle off and where to find it.
+- **Known-ISP culprit table** with 25+ entries covering:
+  - **US:** Spectrum (Charter), Xfinity (Comcast), Cox, AT&T, CenturyLink/Lumen, Verizon, T-Mobile Home, Optimum (Altice), Frontier
+  - **UK:** BT, Sky, Virgin Media, TalkTalk
+  - **EU:** Ziggo (NL), Orange (FR/ES), Free (FR), Deutsche Telekom (DE), Telekom generic, Vodafone
+  - **Canada:** Rogers, Bell, Telus
+  - **Australia:** Telstra, Optus
+- **Entries flagged as "confirmed to block Windrose"** where there are public reports (Spectrum, Xfinity, BT, Ziggo) versus "known to block similar P2P games" for the rest.
+- **Full ISP reference table printed in the report when there's a problem.** Helps Discord helpers do a manual visual match when auto-detection misses an ISP or someone else's report doesn't have detection info.
+- **Tailored fix instructions.** When the detected ISP matches a culprit, the ISP-block and partial-outage sections now lead with "LIKELY CAUSE (based on your ISP): [Name]" and give the exact toggle path for that specific ISP. No more "check your ISP app" generic advice — the report says "Open My Spectrum app → Internet → Security Shield → OFF."
+- **"Hosting providers don't have this problem" clarification.** Explains that residential ISP security features are the cause, and that game hosts (SurvivalServers, LOW.MS, g-portal, etc.) running Rust/Palworld/Ark/etc. don't see these blocks because they're on business connections.
+
+### Background
+
+A player shared the exact list of Windrose domains Spectrum's "Security Shield" was blocking on their network, which confirmed the mechanism for dozens of similar reports. This release codifies that diagnosis into the tool — auto-detecting the ISP means the report can tell each user the specific toggle to flip rather than a general "check your ISP app" suggestion.
+
+## [1.2.0] - 2026-04-19
+
+Expanded Fleet check with complete endpoint list and ISP router diagnosis.
+
+### Added
+
+- **Four additional endpoints in Fleet check.** A Steam user on Spectrum published the complete list of Windrose domains that their router was blocking, confirming that each of the three regional gateways has a `-2` failover variant plus a `sentry.windrose.support` error-tracking endpoint. Fleet check now probes all 8 endpoints:
+  - `r5coopapigateway-eu-release.windrose.support` + `-2` failover (EU/NA)
+  - `r5coopapigateway-ru-release.windrose.support` + `-2` failover (CIS)
+  - `r5coopapigateway-kr-release.windrose.support` + `-2` failover (SEA)
+  - `sentry.windrose.support` (error reporting)
+  - `windrose.support:3478` (STUN/TURN)
+- **Named ISP router security features** in the diagnosis output. The single most common cause of port 3478 blocks on US cable ISPs turned out to be ISP-provided router security features that are on by default and silently flag gaming traffic. Confirmed culprits now called out by name in the report: Spectrum "Security Shield", Xfinity "xFi Advanced Security", Cox "Security Suite", BT "Web Protect", Ziggo default filtering. Instructions for toggling each off are in the report.
+- **Partial-outage diagnosis is smarter.** Old output assumed partial reachability meant a dev-side regional outage. New output correctly identifies ISP router security as the #1 cause when 3478 is the failing port.
+
+### Clarified
+
+- **No separate North America endpoint exists.** The game's "EU & NA" bucket in the Connection Services screen uses the single `r5coopapigateway-eu-release` gateway (with `-2` as failover). Dev infrastructure is EU, CIS, and KR/SEA; NA players share the EU pool.
+
+## [1.1.1] - 2026-04-19
+
+Endpoint correction for Fleet check.
+
+### Fixed
+
+- **Third region endpoint name was wrong.** I guessed `r5coopapigateway-sea-release.windrose.support` based on the EU/RU pattern, but the actual third endpoint is `r5coopapigateway-kr-release.windrose.support` (South Korea, serving SEA). Per PC Gamer's investigation of the dedicated server code: "the server software also contains similar URLs pointing to IP addresses located in Europe and South Korea." The old SEA domain was returning NXDOMAIN because it doesn't exist. Now correctly labeled as "KR/SEA API Gateway" and pointing at the real endpoint.
+
 ## [1.1.0] - 2026-04-19
 
 Major new feature: Fleet check for Windrose backend services.

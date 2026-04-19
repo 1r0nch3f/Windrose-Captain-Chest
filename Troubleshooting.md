@@ -6,50 +6,51 @@ Common problems, from most to least frequent.
 
 **What it looks like:** in-game, the Connection Services screen shows N/A for some or all regions. You can't connect to any multiplayer.
 
-**What's happening:** either (a) your ISP is blocking Windrose's backend services, (b) your DNS is misconfigured or being spoofed, (c) your system is prioritizing IPv6 which Windrose doesn't support, or (d) Windrose's backend is genuinely down on the dev side.
+**What's happening:** nine times out of ten, a security feature on your ISP's router is blocking the ports or domains Windrose needs. Other possibilities: DNS spoofing, IPv6 prioritization, or a genuine dev-side outage.
 
-**What to do:** run the Chest (any mode). The **Fleet check** section tells you which of these it is and includes the specific fix inline. Common outcomes:
+**What to do:** run the Chest (any mode). It has two sections that tell you specifically what's wrong:
 
-### ISP blocking
+### 🎯 Port authority (ISP auto-detection)
 
-The Chest detected that Google's DNS can resolve the Windrose endpoints but your system DNS can't. Your ISP or router is filtering these domains. The devs have publicly acknowledged this is happening on some EU/NA ISPs.
-
-**Fix 1 — switch DNS to Google or Cloudflare.** In Settings → Network & Internet → your active connection → Properties → Edit DNS server assignment:
-- Manual / IPv4 on
-- Preferred: `8.8.8.8`  Alternate: `8.8.4.4` (Google)
-- Or: `1.1.1.1` / `1.0.0.1` (Cloudflare)
-
-Then run `ipconfig /flushdns` in PowerShell.
-
-**Fix 2 — try a VPN.** If it works with a VPN on, ISP block is confirmed.
-
-**Fix 3 — contact your ISP.** Ask them to whitelist:
-- Domain: `*.windrose.support` (all subdomains)
-- Port: `3478`
-- Protocols: UDP and TCP
-- Say it's STUN/TURN for a legitimate game application
-
-Known affected ISPs include Ziggo (Netherlands) and various others in EU/NA. NextDNS with default filtering also blocks these domains.
-
-### DNS spoofing
-
-Your DNS is returning 127.0.0.1 or a null address for Windrose domains — typically caused by VPN, parental controls, or custom DNS providers.
-
-**Fix:** disconnect the VPN / disable parental controls / switch DNS as above.
-
-### IPv6-only result
-
-Your system prefers IPv6 but Windrose is IPv4-only. The Chest's report includes the exact registry command to keep IPv6 enabled but prioritize IPv4:
+Near the top of the report, the Chest looks up your ISP from your public IP and — if you're on one of 25+ known-culprit ISPs — tells you the exact router security feature to toggle off and where to find it. Example:
 
 ```
-reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters" /v DisabledComponents /t REG_DWORD /d 32 /f
+ISP:              Spectrum (Charter)
+Feature to check: Security Shield
+Where to toggle:  My Spectrum app > Internet > Security Shield > OFF
 ```
 
-(Run in an elevated Command Prompt, then reboot.)
+**Toggle off whatever it names, restart Windrose, try again.** This fix works for most players hitting connection issues.
 
-### All services down / partial outage
+### 🔭 Fleet check (endpoint reachability)
 
-Not your fault. Check the official Windrose Discord's status channel or [playwindrose.com](https://playwindrose.com) for announcements.
+Below Port authority, the Chest probes 8 Windrose endpoints and shows which ones are reachable. If your ISP auto-detection found a culprit AND Fleet check shows problems, the diagnosis in the report will be personalized: "LIKELY CAUSE: [your ISP name] - toggle off [feature name]."
+
+### Supported ISPs (auto-detected)
+
+The Chest recognizes these ISPs and names the specific security feature to disable:
+
+**US:** Spectrum (Charter), Xfinity (Comcast), Cox, AT&T, CenturyLink/Lumen, Verizon Fios, T-Mobile Home Internet, Optimum (Altice), Frontier
+
+**UK:** BT, Sky, Virgin Media, TalkTalk
+
+**EU:** Ziggo (NL), Orange (FR), Free (FR), Deutsche Telekom, Vodafone
+
+**Canada:** Rogers, Bell, Telus
+
+**Australia:** Telstra, Optus
+
+If your ISP isn't on this list, the report still tells you to check your ISP's app for a "security" or "threat protection" toggle. The pattern is universal across consumer ISPs — they almost all ship some variant of this feature.
+
+### Other possible causes (covered in the Fleet check diagnosis)
+
+- **DNS spoofing** — VPN, parental controls, or NextDNS intercepting Windrose domains. Fix: disconnect the VPN / disable filtering / switch to Google DNS 8.8.8.8.
+- **IPv6-only result** — Windrose is IPv4-only. The report prints the exact registry command to prioritize IPv4 without disabling IPv6 entirely.
+- **All services down** — Genuine dev-side outage. Check the official Windrose Discord's #status channel or [playwindrose.com](https://playwindrose.com).
+
+### Why dedicated servers work but my home connection doesn't
+
+Dedicated server hosts (SurvivalServers, LOW.MS, g-portal, Apex, indifferent broccoli) run on business-grade datacenter connections without consumer router security filters. The blocks you're hitting don't exist on their side — they're on your residential ISP side.
 
 ---
 

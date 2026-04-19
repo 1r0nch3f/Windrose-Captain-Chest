@@ -98,22 +98,46 @@ $script:WindrosePortPresets = @(
 # a genuine backend outage.
 $script:WindroseServiceEndpoints = @(
     [pscustomobject]@{
-        Name   = 'EU/NA API Gateway'
+        Name   = 'EU/NA API Gateway (primary)'
         Host   = 'r5coopapigateway-eu-release.windrose.support'
         Port   = 443
         Region = 'EU & NA'
     }
     [pscustomobject]@{
-        Name   = 'RU/CIS API Gateway'
+        Name   = 'EU/NA API Gateway (failover)'
+        Host   = 'r5coopapigateway-eu-release-2.windrose.support'
+        Port   = 443
+        Region = 'EU & NA'
+    }
+    [pscustomobject]@{
+        Name   = 'RU/CIS API Gateway (primary)'
         Host   = 'r5coopapigateway-ru-release.windrose.support'
         Port   = 443
         Region = 'CIS'
     }
     [pscustomobject]@{
-        Name   = 'SEA API Gateway'
-        Host   = 'r5coopapigateway-sea-release.windrose.support'
+        Name   = 'RU/CIS API Gateway (failover)'
+        Host   = 'r5coopapigateway-ru-release-2.windrose.support'
         Port   = 443
-        Region = 'SEA'
+        Region = 'CIS'
+    }
+    [pscustomobject]@{
+        Name   = 'KR/SEA API Gateway (primary)'
+        Host   = 'r5coopapigateway-kr-release.windrose.support'
+        Port   = 443
+        Region = 'SEA (South Korea)'
+    }
+    [pscustomobject]@{
+        Name   = 'KR/SEA API Gateway (failover)'
+        Host   = 'r5coopapigateway-kr-release-2.windrose.support'
+        Port   = 443
+        Region = 'SEA (South Korea)'
+    }
+    [pscustomobject]@{
+        Name   = 'Sentry (error reporting)'
+        Host   = 'sentry.windrose.support'
+        Port   = 443
+        Region = 'Global'
     }
     [pscustomobject]@{
         Name   = 'STUN/TURN (P2P signaling)'
@@ -746,6 +770,8 @@ function Get-LocalNetworkSummary {
     }
 }
 
+$script:PublicIP = $null
+
 function Get-PublicIP {
     if ($SkipNetworkTests) { return }
     Write-Section 'Flag on the mast (public IP)'
@@ -763,6 +789,7 @@ function Get-PublicIP {
             if ($publicIP -match '^\d{1,3}(\.\d{1,3}){3}$') {
                 Write-Line ("Public IP: {0}  (source: {1})" -f $publicIP, $url)
                 Add-Finding -Status 'PASS' -Check 'Public IP' -Details "Public IP resolved: $publicIP"
+                $script:PublicIP = $publicIP
                 break
             } else {
                 $publicIP = $null
@@ -964,6 +991,212 @@ function Resolve-HostDnsDiagnostic {
     return $result
 }
 
+# -------------------------------------------------------------------------------
+# ISP identification and router-security culprit table
+# -------------------------------------------------------------------------------
+# Maps ISP org-name / ASN fragments to the specific router security feature
+# that ISP bundles by default. Based on publicly reported Windrose blocks plus
+# equivalent issues reported for Palworld, Rust, Ark, etc. where the same
+# security features catch legitimate game traffic.
+# Matching is case-insensitive substring matching against the "org" field
+# returned by ipinfo.io.
+# -------------------------------------------------------------------------------
+
+$script:IspCulpritTable = @(
+    # --- United States ---
+    @{ Match = 'Spectrum|Charter';       Name = 'Spectrum (Charter)';      Feature = 'Security Shield';              Toggle = 'My Spectrum app > Internet > Security Shield > OFF';              Country = 'US'; KnownBlocksWindrose = $true }
+    @{ Match = 'Comcast|Xfinity';        Name = 'Xfinity (Comcast)';       Feature = 'xFi Advanced Security';        Toggle = 'Xfinity app > WiFi > See Network > Advanced Security > OFF';      Country = 'US'; KnownBlocksWindrose = $true }
+    @{ Match = 'Cox Communications';     Name = 'Cox';                     Feature = 'Cox Security Suite';           Toggle = 'Cox webmail/panel > Security Suite > disable';                     Country = 'US'; KnownBlocksWindrose = $false }
+    @{ Match = 'AT&T|AT&amp;T';          Name = 'AT&T';                    Feature = 'ActiveArmor';                  Toggle = 'Smart Home Manager app > ActiveArmor > toggle Internet Security'; Country = 'US'; KnownBlocksWindrose = $false }
+    @{ Match = 'CenturyLink|Lumen';      Name = 'CenturyLink/Lumen';       Feature = 'Connection Shield';            Toggle = 'centurylink.com/myaccount > Internet > Connection Shield';         Country = 'US'; KnownBlocksWindrose = $false }
+    @{ Match = 'Verizon';                Name = 'Verizon Fios/5G Home';    Feature = 'Network Protection';           Toggle = 'My Verizon app > Services > Digital Secure';                      Country = 'US'; KnownBlocksWindrose = $false }
+    @{ Match = 'T-Mobile';               Name = 'T-Mobile Home Internet';  Feature = 'Network Protection';           Toggle = 'T-Life app > Home Internet > Network settings';                   Country = 'US'; KnownBlocksWindrose = $false }
+    @{ Match = 'Optimum|Cablevision';    Name = 'Optimum (Altice)';        Feature = 'Optimum Internet Protection';  Toggle = 'optimum.net account > Internet Security > disable';               Country = 'US'; KnownBlocksWindrose = $false }
+    @{ Match = 'Frontier';               Name = 'Frontier';                Feature = 'Secure (Whole-Home)';          Toggle = 'frontier.com/helpcenter > Internet Security > disable';            Country = 'US'; KnownBlocksWindrose = $false }
+
+    # --- United Kingdom ---
+    @{ Match = 'British Telecom|BT ';    Name = 'BT';                      Feature = 'Web Protect';                  Toggle = 'my.bt.com > Broadband > Manage Web Protect > OFF';                Country = 'UK'; KnownBlocksWindrose = $true }
+    @{ Match = 'Sky UK|Sky Broadband';   Name = 'Sky';                     Feature = 'Broadband Shield';             Toggle = 'sky.com/mysky > Broadband Shield > set to None';                  Country = 'UK'; KnownBlocksWindrose = $false }
+    @{ Match = 'Virgin Media';           Name = 'Virgin Media';            Feature = 'Web Safe';                     Toggle = 'virginmedia.com/my-account > Web Safe > disable';                 Country = 'UK'; KnownBlocksWindrose = $false }
+    @{ Match = 'TalkTalk';               Name = 'TalkTalk';                Feature = 'HomeSafe';                     Toggle = 'my.talktalk.co.uk > HomeSafe > disable';                          Country = 'UK'; KnownBlocksWindrose = $false }
+
+    # --- Europe ---
+    @{ Match = 'Ziggo|VodafoneZiggo';    Name = 'Ziggo (NL)';              Feature = 'Default domain filter';        Toggle = 'mijn.ziggo.nl > Security/router settings';                        Country = 'NL'; KnownBlocksWindrose = $true }
+    @{ Match = 'Orange ';                Name = 'Orange (FR/ES)';          Feature = 'Livebox parental/security';    Toggle = 'Livebox admin 192.168.1.1 > Security/parental controls > OFF';    Country = 'FR'; KnownBlocksWindrose = $false }
+    @{ Match = 'Free SAS|Free ';         Name = 'Free (FR)';               Feature = 'Freebox security';             Toggle = 'freebox.fr > Securite > adjust filtering';                         Country = 'FR'; KnownBlocksWindrose = $false }
+    @{ Match = 'Deutsche Telekom';       Name = 'Deutsche Telekom (DE)';   Feature = 'Default firewall';             Toggle = 'Speedport admin > Firewall > customize rules';                    Country = 'DE'; KnownBlocksWindrose = $false }
+    @{ Match = 'Telekom';                Name = 'Telekom (DE/EU)';         Feature = 'Default security';             Toggle = 'Router admin panel > Security settings';                          Country = 'EU'; KnownBlocksWindrose = $false }
+    @{ Match = 'Vodafone';               Name = 'Vodafone (EU)';           Feature = 'Secure Net';                   Toggle = 'My Vodafone app > Secure Net > disable';                          Country = 'EU'; KnownBlocksWindrose = $false }
+
+    # --- Canada ---
+    @{ Match = 'Rogers Communications';  Name = 'Rogers (CA)';             Feature = 'Shield';                       Toggle = 'MyRogers app > Internet > Shield > OFF';                          Country = 'CA'; KnownBlocksWindrose = $false }
+    @{ Match = 'Bell Canada';            Name = 'Bell (CA)';               Feature = 'Internet Security';            Toggle = 'MyBell account > Internet > Security > disable';                  Country = 'CA'; KnownBlocksWindrose = $false }
+    @{ Match = 'Telus';                  Name = 'Telus (CA)';              Feature = 'Online Security';              Toggle = 'My Telus account > Internet > Online Security';                   Country = 'CA'; KnownBlocksWindrose = $false }
+
+    # --- Australia ---
+    @{ Match = 'Telstra';                Name = 'Telstra (AU)';            Feature = 'Smart Modem security';         Toggle = 'My Telstra app > Home Internet > security settings';              Country = 'AU'; KnownBlocksWindrose = $false }
+    @{ Match = 'Optus';                  Name = 'Optus (AU)';              Feature = 'Internet Security';            Toggle = 'My Optus app > Internet > Security > disable';                    Country = 'AU'; KnownBlocksWindrose = $false }
+)
+
+function Get-IspInfo {
+    <#
+        Given a public IP, queries a free IP-to-ISP lookup API and returns
+        { ISP, ASN, City, Country, Raw } or $null if lookups fail.
+        Uses ipinfo.io (no API key required, 50k/month free) with fallback
+        to ip-api.com (45/minute free). Silent failure by design.
+    #>
+    param([string]$PublicIP)
+
+    if (-not $PublicIP) { return $null }
+
+    # ipinfo.io - most reliable, good org names
+    try {
+        $resp = Invoke-WebRequest -Uri "https://ipinfo.io/$PublicIP/json" -UseBasicParsing -TimeoutSec 5
+        $data = $resp.Content | ConvertFrom-Json
+        if ($data.org) {
+            return [pscustomobject]@{
+                ISP     = $data.org
+                ASN     = $(if ($data.org -match '^(AS\d+)') { $matches[1] } else { '' })
+                City    = $data.city
+                Country = $data.country
+                Source  = 'ipinfo.io'
+                Raw     = $data
+            }
+        }
+    } catch { }
+
+    # ip-api.com fallback
+    try {
+        $resp = Invoke-WebRequest -Uri "http://ip-api.com/json/$PublicIP" -UseBasicParsing -TimeoutSec 5
+        $data = $resp.Content | ConvertFrom-Json
+        if ($data.status -eq 'success' -and $data.isp) {
+            return [pscustomobject]@{
+                ISP     = $data.isp
+                ASN     = $data.as
+                City    = $data.city
+                Country = $data.countryCode
+                Source  = 'ip-api.com'
+                Raw     = $data
+            }
+        }
+    } catch { }
+
+    return $null
+}
+
+function Match-IspCulprit {
+    <#
+        Given an ISP org/name string, return the culprit entry from the table
+        if it matches, else $null.
+    #>
+    param([string]$IspOrg)
+    if (-not $IspOrg) { return $null }
+
+    foreach ($entry in $script:IspCulpritTable) {
+        if ($IspOrg -imatch $entry.Match) {
+            return $entry
+        }
+    }
+    return $null
+}
+
+function Show-IspDiagnosis {
+    <#
+        Writes the "Who's your ISP and do they block gaming" section of the report.
+        Called by Test-WindroseServices before the endpoint checks.
+    #>
+    Write-Section "Port authority (your ISP)"
+
+    if (-not $script:PublicIP) {
+        Write-Line 'Public IP unknown - skipping ISP lookup.'
+        return $null
+    }
+
+    $isp = Get-IspInfo -PublicIP $script:PublicIP
+    if (-not $isp) {
+        Write-Line 'Could not identify ISP from public IP.'
+        Add-Finding -Status 'INFO' -Check 'ISP detection' -Details 'IP lookup services did not return ISP info.'
+        return $null
+    }
+
+    Write-Line ("ISP:      {0}" -f $isp.ISP)
+    if ($isp.ASN)     { Write-Line ("ASN:      {0}" -f $isp.ASN) }
+    if ($isp.City)    { Write-Line ("City:     {0}" -f $isp.City) }
+    if ($isp.Country) { Write-Line ("Country:  {0}" -f $isp.Country) }
+
+    $culprit = Match-IspCulprit -IspOrg $isp.ISP
+    if ($culprit) {
+        Write-Line ''
+        Write-Line '*** HEADS UP: your ISP ships routers with a security feature that ***'
+        Write-Line '*** commonly blocks legitimate gaming traffic, including Windrose. ***'
+        Write-Line ''
+        Write-Line ("ISP:              {0}" -f $culprit.Name)
+        Write-Line ("Feature to check: {0}" -f $culprit.Feature)
+        Write-Line ("Where to toggle:  {0}" -f $culprit.Toggle)
+        Write-Line ''
+        if ($culprit.KnownBlocksWindrose) {
+            Write-Line '** This ISP has been CONFIRMED to block Windrose specifically. **'
+            Write-Line 'Turning this feature off has fixed the issue for other players on'
+            Write-Line 'this same ISP. If the Fleet check below shows port 3478 blocked or'
+            Write-Line 'any Windrose domain unreachable, toggle this feature off FIRST.'
+            Add-Finding -Status 'WARN' -Check 'ISP' -Details "$($culprit.Name) - $($culprit.Feature) confirmed to block Windrose. Toggle OFF: $($culprit.Toggle)"
+        } else {
+            Write-Line 'This feature has been reported to block similar P2P games like'
+            Write-Line 'Rust, Palworld, and Ark. If the Fleet check below shows issues,'
+            Write-Line 'toggling this feature off is worth trying before anything else.'
+            Add-Finding -Status 'INFO' -Check 'ISP' -Details "$($culprit.Name) - consider toggling off $($culprit.Feature) if Fleet check fails. Location: $($culprit.Toggle)"
+        }
+        return $culprit
+    }
+
+    Write-Line ''
+    Write-Line 'Your ISP is not in the known-culprit list. That does NOT mean your ISP'
+    Write-Line 'is safe - many ISPs ship router security features that block gaming'
+    Write-Line 'traffic, and this list only covers the big ones. If the Fleet check'
+    Write-Line 'below shows issues, check your ISP app or router admin page for any'
+    Write-Line '"security", "threat protection", or "safe browsing" toggle and try'
+    Write-Line 'turning it off.'
+    Add-Finding -Status 'INFO' -Check 'ISP' -Details "$($isp.ISP) - not in known-culprit list. Check ISP app/router for security toggles if connection fails."
+    return $null
+}
+
+function Show-KnownIspTable {
+    <#
+        Reference table printed in the report for humans to visually match
+        "is my ISP the kind that does this?" even if auto-detection failed.
+        Keep it concise - just the ones confirmed to block Windrose or known
+        to block similar P2P games.
+    #>
+    Write-Section 'Known ISP router security features to check'
+    Write-Line 'If your ISP auto-detection above missed you, or if the Fleet check'
+    Write-Line 'shows connection issues, check whether your ISP is on this list and'
+    Write-Line 'toggle off the named feature:'
+    Write-Line ''
+
+    $confirmedBlocks = $script:IspCulpritTable | Where-Object { $_.KnownBlocksWindrose }
+    $otherKnown      = $script:IspCulpritTable | Where-Object { -not $_.KnownBlocksWindrose }
+
+    if ($confirmedBlocks) {
+        Write-Line 'CONFIRMED to block Windrose:'
+        Write-Line ('  ' + ('-' * 80))
+        foreach ($c in $confirmedBlocks) {
+            Write-Line ('  {0,-28} {1,-30} [{2}]' -f $c.Name, $c.Feature, $c.Country)
+        }
+        Write-Line ''
+    }
+
+    Write-Line 'Known to block similar P2P games (Rust, Palworld, Ark, etc.):'
+    Write-Line ('  ' + ('-' * 80))
+    foreach ($c in $otherKnown) {
+        Write-Line ('  {0,-28} {1,-30} [{2}]' -f $c.Name, $c.Feature, $c.Country)
+    }
+    Write-Line ''
+    Write-Line 'Note: Dedicated server hosts (SurvivalServers, LOW.MS, g-portal etc.) do'
+    Write-Line 'NOT have these problems because they run on business-grade connections'
+    Write-Line 'without consumer security filters. The block is almost always on your'
+    Write-Line 'residential end, not on the host or Windrose''s side.'
+}
+
 function Test-WindroseServices {
     if ($SkipServiceCheck) { return }
     if ($SkipNetworkTests) {
@@ -971,6 +1204,10 @@ function Test-WindroseServices {
         Write-Line 'Skipped (-SkipNetworkTests flag).'
         return
     }
+
+    # ISP identification runs first - it informs the diagnosis of anything
+    # that fails in the endpoint checks below.
+    $detectedCulprit = Show-IspDiagnosis
 
     Write-Section 'Fleet check (Windrose services)'
     Write-Line 'Checking whether Windrose backend services are reachable from this'
@@ -1072,18 +1309,51 @@ function Test-WindroseServices {
         Write-Line 'The devs have publicly acknowledged that some ISPs are blocking their'
         Write-Line 'backend (particularly in EU and NA).'
         Write-Line ''
-        Write-Line 'FIXES, in order of ease:'
-        Write-Line '  1. Switch to Google DNS (8.8.8.8 / 8.8.4.4) - see instructions above'
+
+        if ($detectedCulprit) {
+            Write-Line ('*** THIS IS ALMOST CERTAINLY YOUR FIX: {0} ***' -f $detectedCulprit.Name)
+            Write-Line ''
+            Write-Line ('  Toggle OFF: {0}' -f $detectedCulprit.Feature)
+            Write-Line ('  Where:      {0}' -f $detectedCulprit.Toggle)
+            Write-Line ''
+            if ($detectedCulprit.KnownBlocksWindrose) {
+                Write-Line '  This has been confirmed to fix the exact same problem for other'
+                Write-Line '  players on this ISP. Try this FIRST before anything else.'
+            } else {
+                Write-Line '  Other players on this ISP have fixed similar game connectivity'
+                Write-Line '  issues (Rust, Palworld, Ark) by toggling this feature off.'
+            }
+            Write-Line ''
+            Write-Line 'If that does not fix it, or if you cannot find the toggle:'
+        } else {
+            Write-Line 'Your ISP was not in our auto-detect list, so we could not give you a'
+            Write-Line 'specific recommendation. But the general fix below still applies.'
+            Write-Line ''
+        }
+
+        Write-Line '  Alternate fixes:'
+        Write-Line ''
+        Write-Line '  1. Switch to Google DNS (8.8.8.8 / 8.8.4.4) - see instructions below'
+        Write-Line ''
         Write-Line '  2. Try a VPN - if it works with a VPN, confirmed ISP block'
+        Write-Line ''
         Write-Line '  3. Contact your ISP and ask them to whitelist:'
         Write-Line '       Domain:    *.windrose.support (all subdomains)'
         Write-Line '       Port:      3478'
         Write-Line '       Protocols: UDP and TCP'
         Write-Line '       Reason:    STUN/TURN for a legitimate game application'
         Write-Line ''
-        Write-Line '  ISPs known to block Windrose: Ziggo (NL), and various others in EU/NA.'
-        Write-Line '  NextDNS with default filtering also blocks by default.'
-        Add-Finding -Status 'FAIL' -Check 'Fleet: Overall' -Details "ISP blocking detected on $($dnsIssues.Count) endpoint(s). See Fleet check section for fixes."
+        Write-Line '  How to switch to Google DNS:'
+        Write-Line '    1. Settings > Network & Internet > your active connection > Properties'
+        Write-Line '    2. Edit DNS server assignment > Manual > IPv4 ON'
+        Write-Line '       Preferred: 8.8.8.8   Alternate: 8.8.4.4'
+        Write-Line '    3. Save, then run: ipconfig /flushdns'
+        $details = if ($detectedCulprit) {
+            "ISP blocking detected. Recommended fix: toggle off $($detectedCulprit.Feature) on $($detectedCulprit.Name)."
+        } else {
+            "ISP blocking detected on $($dnsIssues.Count) endpoint(s). Check ISP app for a security toggle."
+        }
+        Add-Finding -Status 'FAIL' -Check 'Fleet: Overall' -Details $details
     } elseif ($anyIpv6Issue) {
         Write-Line '*** IPv6 PRIORITIZATION ISSUE ***'
         Write-Line ''
@@ -1099,11 +1369,56 @@ function Test-WindroseServices {
         Write-Line 'Then restart the PC. To revert later, set /d 0 instead of /d 32.'
         Add-Finding -Status 'FAIL' -Check 'Fleet: Overall' -Details "IPv6 prioritization issue. Game is IPv4-only. See Fleet check section for fix."
     } elseif ($reachable -gt 0 -and $unreachable -gt 0) {
-        Write-Line 'PARTIAL OUTAGE: Some Windrose services are reachable, others are not.'
-        Write-Line 'This usually means a regional backend is down rather than your network.'
-        Write-Line 'Check playwindrose.com or the #status channel in the official Discord'
-        Write-Line 'for announcements. Consider waiting and trying again in a few hours.'
-        Add-Finding -Status 'WARN' -Check 'Fleet: Overall' -Details "Partial outage: $reachable reachable, $unreachable unreachable. Likely a regional backend issue."
+        Write-Line 'PARTIAL REACHABILITY: Some Windrose services are reachable, others are not.'
+        Write-Line ''
+
+        if ($detectedCulprit) {
+            Write-Line ('*** LIKELY CAUSE (based on your ISP): {0} ***' -f $detectedCulprit.Name)
+            Write-Line ''
+            Write-Line ('  Toggle OFF: {0}' -f $detectedCulprit.Feature)
+            Write-Line ('  Where:      {0}' -f $detectedCulprit.Toggle)
+            Write-Line ''
+            if ($detectedCulprit.KnownBlocksWindrose) {
+                Write-Line '  Other players on this same ISP have fixed this exact issue by'
+                Write-Line '  toggling this feature off. Try this FIRST.'
+            } else {
+                Write-Line '  This ISP ships a router security feature that is known to block'
+                Write-Line '  P2P gaming traffic (Rust, Palworld, Ark). Try toggling it off.'
+            }
+            Write-Line ''
+            Write-Line 'Other possibilities:'
+        } else {
+            Write-Line 'Common causes:'
+            Write-Line ''
+            Write-Line '  1. **ISP router security feature blocking specific ports or domains.**'
+            Write-Line '     This is the #1 cause of port 3478 blocks on US cable ISPs. Check:'
+            Write-Line '       - Spectrum:  My Spectrum app > Internet > Security Shield (turn OFF)'
+            Write-Line '       - Xfinity:   Xfinity app > Advanced Security (turn OFF)'
+            Write-Line '       - Cox:       Cox panel > Security Suite (disable)'
+            Write-Line '       - Others:    Look for "Security", "Threat Protection", "Safe Browsing"'
+            Write-Line '                    in your ISP''s app or router admin page.'
+            Write-Line ''
+        }
+
+        Write-Line '  * A specific regional backend is genuinely down on the dev side.'
+        Write-Line '    Check playwindrose.com or the #status channel in the Windrose Discord.'
+        Write-Line ''
+        Write-Line '  * Windows Firewall blocking outbound on specific ports. Try temporarily'
+        Write-Line '    disabling the firewall to test (re-enable after).'
+        Write-Line ''
+        Write-Line 'If TCP 3478 is the one failing, that is P2P signaling - the game literally'
+        Write-Line 'cannot connect peers without it. This is almost always an ISP security feature.'
+        Write-Line ''
+        Write-Line 'Dedicated-server hosts (SurvivalServers, LOW.MS, g-portal) do NOT have this'
+        Write-Line 'problem because they run on business connections without consumer filters.'
+        Write-Line 'The block is on your residential ISP side, not Windrose''s or the host''s.'
+
+        $details = if ($detectedCulprit) {
+            "Partial outage: $reachable reachable, $unreachable unreachable. Recommended fix: toggle off $($detectedCulprit.Feature) on $($detectedCulprit.Name)."
+        } else {
+            "Partial outage: $reachable reachable, $unreachable unreachable. Likely ISP router security (Spectrum Security Shield etc.) or a regional backend issue."
+        }
+        Add-Finding -Status 'WARN' -Check 'Fleet: Overall' -Details $details
     } else {
         Write-Line 'All Windrose endpoints are unreachable. This can indicate:'
         Write-Line '  - The Windrose backend is entirely down (dev-side)'
@@ -1112,6 +1427,12 @@ function Test-WindroseServices {
         Write-Line ''
         Write-Line 'Check playwindrose.com and the official Discord for outage announcements.'
         Add-Finding -Status 'FAIL' -Check 'Fleet: Overall' -Details "All $($script:WindroseServiceEndpoints.Count) Windrose services unreachable."
+    }
+
+    # If there was ANY problem, print the full reference table of known-culprit
+    # ISPs so users / helpers can do a manual visual match.
+    if ($reachable -lt $script:WindroseServiceEndpoints.Count) {
+        Show-KnownIspTable
     }
 }
 

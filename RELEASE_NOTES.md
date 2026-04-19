@@ -1,54 +1,74 @@
-# 🏴‍☠️ Windrose Captain's Chest v1.1.0
+# 🏴‍☠️ Windrose Captain's Chest v1.3.0
 
-Big new feature: **Fleet check** for Windrose backend services.
+**The big one.** Bundles the Fleet check feature (v1.1.0–v1.2.0) with the new ISP auto-detection and named-culprit diagnosis. If Windrose won't connect, this release tells you *exactly* which setting on *your specific ISP* to change.
 
-## 🆕 What's new
+## 🆕 What's new in v1.3.0
 
-### Fleet check — diagnoses "Connection Services: N/A"
+### Port authority — ISP auto-detection
 
-If the game shows **N/A** for EU & NA, SEA, or CIS in its Connection Services screen, this release tells you *why*.
+A new report section identifies your ISP from your public IP and — if they're on the known-culprit list — tells you the exact router security feature to toggle off. No more Googling, no more guessing.
 
-The Chest now probes Windrose's own backend endpoints and diagnoses what's happening:
+Example output if you're on Spectrum:
 
-- `r5coopapigateway-eu-release.windrose.support` (EU/NA gateway)
-- `r5coopapigateway-ru-release.windrose.support` (CIS gateway)
-- `r5coopapigateway-sea-release.windrose.support` (SEA gateway)
-- `windrose.support:3478` (STUN/TURN — P2P signaling)
+```
+=== Port authority (your ISP) ===
+ISP:      AS20115 Spectrum
+ASN:      AS20115
+City:     Dalton
+Country:  US
 
-Each endpoint is resolved via **both** your system DNS and Google's 8.8.8.8, then tested on TCP. The diagnosis distinguishes between:
+*** HEADS UP: your ISP ships routers with a security feature that ***
+*** commonly blocks legitimate gaming traffic, including Windrose. ***
 
-| Finding | What it means |
-|--------|---------------|
-| **ISP blocking** | Your ISP/router blocks the domain. Google DNS resolves it fine, yours doesn't. |
-| **DNS spoofing** | Your DNS is returning 127.0.0.1 or null — VPN, parental controls, or NextDNS-style filter |
-| **IPv6-only** | Only IPv6 returned but Windrose is IPv4-only. Needs a registry tweak. |
-| **DNS timeout** | Your DNS server isn't responding at all |
-| **All reachable** | Backend is fine from your end — issue is elsewhere |
-| **Partial outage** | Some regions work, others don't — likely a dev-side regional issue |
-| **All down** | Backend entirely unreachable — check the official Discord for outage announcements |
+ISP:              Spectrum (Charter)
+Feature to check: Security Shield
+Where to toggle:  My Spectrum app > Internet > Security Shield > OFF
 
-### Fix instructions included in the report
+** This ISP has been CONFIRMED to block Windrose specifically. **
+Turning this feature off has fixed the issue for other players on
+this same ISP.
+```
 
-When a problem is detected, the report includes the exact fix directly — DNS switch instructions for Google/Cloudflare, the precise wording to use when contacting your ISP, or the registry command to prioritize IPv4 over IPv6. No need to scour forums.
+### 25+ named ISPs with specific fix instructions
 
-### New flag
+| Region | Covered ISPs |
+|--------|-------------|
+| 🇺🇸 US | Spectrum, Xfinity, Cox, AT&T, CenturyLink/Lumen, Verizon, T-Mobile Home, Optimum, Frontier |
+| 🇬🇧 UK | BT, Sky, Virgin Media, TalkTalk |
+| 🇪🇺 EU | Ziggo (NL), Orange (FR), Free (FR), Deutsche Telekom, Vodafone |
+| 🇨🇦 CA | Rogers, Bell, Telus |
+| 🇦🇺 AU | Telstra, Optus |
 
-- `-SkipServiceCheck` — skip the Fleet check if you don't need it
+Each entry includes the specific "security feature" name and step-by-step toggle instructions.
 
-## Why this matters
+### Everything from v1.1.0 and v1.2.0 — Fleet check
 
-The Windrose devs have publicly asked for help diagnosing ISP connectivity issues. Some ISPs — particularly in EU and NA — are blocking the backend domains. Before this release, a user seeing "N/A" in the game had no way to distinguish between "my ISP is blocking it" and "the servers are down." Now helpers on Discord can triage in seconds.
+If you're installing fresh, you also get:
+
+- **Fleet check** — probes 8 Windrose backend endpoints (all three regional gateways + failovers + sentry + STUN/TURN) and diagnoses whether issues are ISP blocking, DNS spoofing, IPv6 prioritization, dev-side outages, or just you
+- **Dual-DNS diagnosis** — each endpoint resolved via both system DNS and Google 8.8.8.8 so the tool can distinguish ISP block from genuine outage
+- **Inline fix instructions** — DNS switch commands, ISP whitelist template, IPv6-to-IPv4 registry command, all printed in the report
+- **"EU & NA shared gateway" clarification** — the game's in-game list combines EU and NA for a reason; there's no separate NA endpoint
 
 ## 📥 Quick start
 
-Same as before — download `CaptainsChest-v1.1.0.zip`, extract, double-click the exe, accept SmartScreen/UAC, pick a mode.
+1. Download **CaptainsChest-v1.3.0.zip** below
+2. Extract anywhere
+3. Double-click `CaptainsChest.exe` — SmartScreen "More info" → "Run anyway", then UAC → Yes
+4. Pick any mode — Fleet check and ISP detection run in all three
 
-The Fleet check runs automatically in all three modes. Takes about 5 seconds to add to a run.
+### ⚠️ Antivirus note
 
-## Full changelog
+Same as always — the exe is compiled with `ps2exe`, Windows Defender sometimes flags it as a false positive. Source `.ps1` is in the same zip for inspection.
 
-See the [changelog](https://github.com/1r0nch3f/Windrose-Captain-Chest/blob/main/CHANGELOG.md) for complete release history.
+## 💬 A note on hosting providers
 
----
+If you've wondered "if SurvivalServers / LOW.MS / g-portal can host Rust and Palworld fine, why does Windrose fail?" — the answer is: **they do work fine on those hosts.** The block is on your residential ISP side, not the host's. Dedicated-server hosts run on business-grade connections without consumer router security filters. This release now explains that directly in the report.
 
-Fair winds. 🏴‍☠️
+## 📖 See also
+
+- [Wiki](https://github.com/1r0nch3f/Windrose-Captain-Chest/wiki) — usage guide, troubleshooting
+- [Changelog](https://github.com/1r0nch3f/Windrose-Captain-Chest/blob/main/CHANGELOG.md) — full release history
+- [Issues](https://github.com/1r0nch3f/Windrose-Captain-Chest/issues) — report bugs or add your ISP to the culprit table
+
+Fair winds, Captain. 🏴‍☠️
