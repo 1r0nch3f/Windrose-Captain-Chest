@@ -5,6 +5,17 @@ All notable changes to Windrose Captain's Chest will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-04-19
+
+Bug-fix release. Four real-world issues surfaced by first-run testing.
+
+### Fixed
+
+- **OS version now reports correctly on Windows 11.** `Get-ComputerInfo`'s `WindowsProductName` occasionally returns "Windows 10 Pro" on Windows 11 systems. Switched to reading the registry's ProductName and DisplayVersion, cross-referenced with build number (build 22000+ = Win 11).
+- **GPU VRAM now reads correctly for cards larger than 4GB.** The WMI `AdapterRAM` field is a 32-bit integer that overflows for modern GPUs (e.g., RX 7900 XTX reporting 4GB instead of 24GB). Added registry fallback via `HKLM:\SOFTWARE\Microsoft\DirectX` which stores VRAM as a 64-bit value.
+- **VC++ runtime listing no longer errors on uninstall keys with no DisplayName.** Added a null-safe filter before the name match.
+- **Windrose install auto-detection now finds custom Steam library locations.** The old detection only checked the primary Steam install's `libraryfolders.vdf`. The new version: (a) reads Steam's install path from the registry, (b) scans all fixed drives for `SteamLibrary`, `Steam`, `Games\SteamLibrary`, and `Games\Steam` folders, and (c) falls back to parsing existing Windrose firewall rules to locate the install if all else fails.
+
 ## [1.0.0] - 2026-04-19
 
 First stable release. A single standalone PowerShell diagnostic for Windrose crews.

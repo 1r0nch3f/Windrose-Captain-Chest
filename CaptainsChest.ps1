@@ -290,11 +290,35 @@ function Prompt-ServerTarget {
 # -------------------------------------------------------------------------------
 
 function Get-OsInfo {
-    Run-CommandCapture -Label "Ship's papers (OS)" -Command {
-        Get-ComputerInfo |
-            Select-Object WindowsProductName, WindowsVersion, OsBuildNumber, OsArchitecture, CsName |
-            Format-List
+    Write-Section "Ship's papers (OS)"
+
+    # Get-ComputerInfo's WindowsProductName can incorrectly report "Windows 10 Pro"
+    # on Windows 11 systems. Use the registry ProductName and cross-reference with
+    # build number to get the right marketing name.
+    $os = Get-CimInstance Win32_OperatingSystem
+    $build = [int]$os.BuildNumber
+    $arch  = $os.OSArchitecture
+
+    # Build 22000+ is Windows 11; below that is Windows 10
+    $edition = try {
+        (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name ProductName).ProductName
+    } catch { $os.Caption }
+
+    $marketingName = if ($build -ge 22000) {
+        $edition -replace 'Windows 10', 'Windows 11'
+    } else {
+        $edition
     }
+
+    $displayVersion = try {
+        (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name DisplayVersion -ErrorAction Stop).DisplayVersion
+    } catch { '' }
+
+    Write-Line ("Product:      {0}" -f $marketingName)
+    if ($displayVersion) { Write-Line ("Version:      {0}" -f $displayVersion) }
+    Write-Line ("Build:        {0}" -f $build)
+    Write-Line ("Architecture: {0}" -f $arch)
+    Write-Line ("Host:         {0}" -f $env:COMPUTERNAME)
 }
 
 function Get-CpuAndMemory {
@@ -306,6 +330,29 @@ function Get-CpuAndMemory {
             Select-Object @{N='TotalPhysicalMemoryGB';E={[math]::Round($_.TotalPhysicalMemory/1GB,2)}} |
             Format-List
     }
+}
+
+function Get-GpuVramGB {
+    param([string]$GpuName)
+
+    # Win32_VideoController.AdapterRAM is a UInt32 that overflows at 4GB - any
+    # GPU with more VRAM than that will report 4 (or a bogus smaller number).
+    # The registry under DirectX has the right value in QWORD form.
+    try {
+        $regPath = 'HKLM:\SOFTWARE\Microsoft\DirectX'
+        if (Test-Path $regPath) {
+            $adapters = Get-ChildItem $regPath -ErrorAction SilentlyContinue | Where-Object {
+                $_.PSChildName -match '^\{[0-9A-Fa-f\-]+\}$'
+            }
+            foreach ($adapter in $adapters) {
+                $props = Get-ItemProperty $adapter.PSPath -ErrorAction SilentlyContinue
+                if ($props.Description -eq $GpuName -and $props.DedicatedVideoMemory) {
+                    return [math]::Round($props.DedicatedVideoMemory / 1GB, 1)
+                }
+            }
+        }
+    } catch { }
+    return $null
 }
 
 function Get-GpuInfoWithDriverAge {
@@ -325,7 +372,12 @@ function Get-GpuInfoWithDriverAge {
             }
         } catch { }
 
-        $ramGB = if ($gpu.AdapterRAM) { [math]::Round($gpu.AdapterRAM / 1GB, 2) } else { 'unknown' }
+        # Prefer registry-sourced VRAM (fixes 4GB cap bug), fall back to WMI
+        $vramGB = Get-GpuVramGB -GpuName $gpu.Name
+        if (-not $vramGB -and $gpu.AdapterRAM) {
+            $vramGB = [math]::Round($gpu.AdapterRAM / 1GB, 2)
+        }
+        $vramDisplay = if ($vramGB) { "$vramGB" } else { 'unknown' }
 
         Write-Line ("Name:           {0}" -f $gpu.Name)
         Write-Line ("Driver Version: {0}" -f $gpu.DriverVersion)
@@ -343,7 +395,7 @@ function Get-GpuInfoWithDriverAge {
             Write-Line 'Driver Date:    unknown'
             Add-Finding -Status 'INFO' -Check 'GPU driver age' -Details ("{0} driver date could not be determined." -f $gpu.Name)
         }
-        Write-Line ("VRAM (GB):      {0}" -f $ramGB)
+        Write-Line ("VRAM (GB):      {0}" -f $vramDisplay)
         Write-Line ''
     }
 }
@@ -708,6 +760,24 @@ function Get-BaselineConnectivity {
 # Hold inventory / watch posts / crew
 # -------------------------------------------------------------------------------
 
+function Get-SteamInstallPath {
+    # Steam's install path from the registry is the most reliable starting point.
+    $regPaths = @(
+        'HKLM:\SOFTWARE\WOW6432Node\Valve\Steam',
+        'HKLM:\SOFTWARE\Valve\Steam',
+        'HKCU:\SOFTWARE\Valve\Steam'
+    )
+    foreach ($reg in $regPaths) {
+        try {
+            $p = (Get-ItemProperty -Path $reg -Name 'InstallPath' -ErrorAction Stop).InstallPath
+            if ($p -and (Test-Path $p)) { return $p }
+            $p = (Get-ItemProperty -Path $reg -Name 'SteamPath' -ErrorAction Stop).SteamPath
+            if ($p -and (Test-Path $p)) { return $p -replace '/', '\' }
+        } catch { continue }
+    }
+    return $null
+}
+
 function Get-WindrosePaths {
     $paths = @()
     $common = @(
@@ -724,11 +794,21 @@ function Get-WindrosePaths {
 
 function Get-SteamLibraries {
     $libs = @()
-    $vdfPaths = @(
+
+    # Build list of libraryfolders.vdf candidates - registry path plus legacy defaults
+    $vdfCandidates = @(
         "$env:ProgramFiles(x86)\Steam\steamapps\libraryfolders.vdf",
-        "$env:ProgramFiles\Steam\steamapps\libraryfolders.vdf"
+        "$env:ProgramFiles\Steam\steamapps\libraryfolders.vdf",
+        "C:\Steam\steamapps\libraryfolders.vdf"
     )
-    foreach ($vdf in $vdfPaths) {
+
+    $steamRoot = Get-SteamInstallPath
+    if ($steamRoot) {
+        $vdfCandidates += (Join-Path $steamRoot 'steamapps\libraryfolders.vdf')
+        $libs += $steamRoot
+    }
+
+    foreach ($vdf in ($vdfCandidates | Select-Object -Unique)) {
         if (Test-Path $vdf) {
             $content = Get-Content $vdf -Raw
             $ms = [regex]::Matches($content, '"path"\s+"([^"]+)"')
@@ -737,6 +817,26 @@ function Get-SteamLibraries {
             }
         }
     }
+
+    # Brute-force scan fixed drives for *SteamLibrary* and *SteamLibraries*
+    # folders. Catches the common case where users put a library on another
+    # drive without Steam's own config catching up.
+    try {
+        $drives = Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue |
+            Where-Object { $_.Free -gt 0 -and $_.Root -match '^[A-Z]:\\$' }
+        foreach ($d in $drives) {
+            $candidates = @(
+                Join-Path $d.Root 'SteamLibrary',
+                Join-Path $d.Root 'Steam',
+                Join-Path $d.Root 'Games\SteamLibrary',
+                Join-Path $d.Root 'Games\Steam'
+            )
+            foreach ($c in $candidates) {
+                if (Test-Path $c) { $libs += $c }
+            }
+        }
+    } catch { }
+
     return $libs | Select-Object -Unique
 }
 
@@ -744,9 +844,33 @@ function Find-WindroseInstall {
     $candidates = Get-WindrosePaths
     $libs = Get-SteamLibraries
     foreach ($lib in $libs) {
-        $c = Join-Path $lib 'steamapps\common\Windrose'
-        if (Test-Path $c) { $candidates += $c }
+        # Try both direct and nested steamapps paths
+        $c1 = Join-Path $lib 'steamapps\common\Windrose'
+        $c2 = Join-Path $lib 'common\Windrose'
+        if (Test-Path $c1) { $candidates += $c1 }
+        if (Test-Path $c2) { $candidates += $c2 }
     }
+
+    # Last resort: scan firewall rules for an already-known Windrose.exe path.
+    # If Windows has ever seen the game run, its .exe will show up in rules.
+    try {
+        $firewallPath = Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue |
+            Where-Object { $_.Program -match '\\Windrose\\.*Windrose\.exe$' -or $_.Program -match '\\Windrose\\.*R5.*\.exe$' } |
+            Select-Object -ExpandProperty Program -First 1
+        if ($firewallPath) {
+            # Walk up to the Windrose folder: ...\common\Windrose\Windrose.exe -> ...\common\Windrose
+            $installDir = Split-Path $firewallPath -Parent
+            while ($installDir -and (Split-Path $installDir -Leaf) -ne 'Windrose') {
+                $parent = Split-Path $installDir -Parent
+                if ($parent -eq $installDir) { $installDir = $null; break }
+                $installDir = $parent
+            }
+            if ($installDir -and (Test-Path $installDir)) {
+                $candidates += $installDir
+            }
+        }
+    } catch { }
+
     return $candidates | Select-Object -Unique
 }
 
@@ -901,9 +1025,9 @@ function Check-RecentErrors {
 
 function Check-VCRuntimes {
     Run-CommandCapture -Label 'Powder magazine (VC++ runtimes)' -Command {
-        Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall' |
-            Get-ItemProperty |
-            Where-Object { $_.DisplayName -match 'Visual C\+\+' } |
+        Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue |
+            Get-ItemProperty -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSObject.Properties.Name -contains 'DisplayName' -and $_.DisplayName -and $_.DisplayName -match 'Visual C\+\+' } |
             Sort-Object DisplayName |
             Select-Object DisplayName, DisplayVersion, Publisher |
             Format-Table -Auto
