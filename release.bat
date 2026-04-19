@@ -7,7 +7,7 @@ REM  Creates a git tag, pushes it, builds a clean distribution
 REM  zip, and (if gh CLI is installed) publishes the release.
 REM ============================================================
 
-set "VERSION=v1.0.2"
+set "VERSION=v1.0.3"
 set "REPO=1r0nch3f/Windrose-Captain-Chest"
 set "DIST_ZIP=CaptainsChest-%VERSION%.zip"
 set "DIST_DIR=_dist"

@@ -584,7 +584,15 @@ function Test-Seaworthy {
     $targetDrive = $null
     $installs = Find-WindroseInstall
     if ($installs -and $installs.Count -gt 0) {
-        $targetDrive = ($installs[0]).Substring(0,1)
+        # Robustly extract a drive letter from the first install path. Guards
+        # against any upstream weirdness with array shape or path concatenation.
+        $firstPath = [string]$installs[0]
+        if ($firstPath -match '^([A-Za-z]):\\') {
+            $targetDrive = $matches[1].ToUpper()
+        }
+    }
+
+    if ($targetDrive) {
         Write-Line ("Storage: checking drive {0}: (Windrose install drive)" -f $targetDrive)
     } else {
         $targetDrive = 'C'
@@ -853,24 +861,45 @@ function Get-SteamLibraries {
 }
 
 function Find-WindroseInstall {
-    $candidates = Get-WindrosePaths
-    $libs = Get-SteamLibraries
-    foreach ($lib in $libs) {
-        # Try both direct and nested steamapps paths
+    $candidates = New-Object System.Collections.Generic.List[string]
+
+    # Helper: add a path to the list, normalizing it first. Skips empty/bogus entries.
+    $addPath = {
+        param($p)
+        if ([string]::IsNullOrWhiteSpace($p)) { return }
+        try {
+            # Force to a clean string. Resolve-Path gives a canonical form but fails
+            # on non-existent paths, so fall back to trimming.
+            $normalized = $null
+            try {
+                $normalized = (Resolve-Path -LiteralPath $p -ErrorAction Stop).Path
+            } catch {
+                $normalized = $p.ToString().TrimEnd('\').Trim()
+            }
+            if (-not [string]::IsNullOrWhiteSpace($normalized) -and $normalized -match ':\\') {
+                $candidates.Add($normalized)
+            }
+        } catch { }
+    }
+
+    foreach ($p in (Get-WindrosePaths)) {
+        & $addPath $p
+    }
+
+    foreach ($lib in (Get-SteamLibraries)) {
         $c1 = Join-Path $lib 'steamapps\common\Windrose'
         $c2 = Join-Path $lib 'common\Windrose'
-        if (Test-Path $c1) { $candidates += $c1 }
-        if (Test-Path $c2) { $candidates += $c2 }
+        if (Test-Path $c1) { & $addPath $c1 }
+        if (Test-Path $c2) { & $addPath $c2 }
     }
 
     # Last resort: scan firewall rules for an already-known Windrose.exe path.
-    # If Windows has ever seen the game run, its .exe will show up in rules.
     try {
         $firewallPath = Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue |
             Where-Object { $_.Program -match '\\Windrose\\.*Windrose\.exe$' -or $_.Program -match '\\Windrose\\.*R5.*\.exe$' } |
             Select-Object -ExpandProperty Program -First 1
         if ($firewallPath) {
-            # Walk up to the Windrose folder: ...\common\Windrose\Windrose.exe -> ...\common\Windrose
+            # Walk up to the Windrose folder
             $installDir = Split-Path $firewallPath -Parent
             while ($installDir -and (Split-Path $installDir -Leaf) -ne 'Windrose') {
                 $parent = Split-Path $installDir -Parent
@@ -878,12 +907,20 @@ function Find-WindroseInstall {
                 $installDir = $parent
             }
             if ($installDir -and (Test-Path $installDir)) {
-                $candidates += $installDir
+                & $addPath $installDir
             }
         }
     } catch { }
 
-    return $candidates | Select-Object -Unique
+    # Case-insensitive dedupe (Windows paths aren't case-sensitive)
+    $seen = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+    $unique = New-Object System.Collections.Generic.List[string]
+    foreach ($c in $candidates) {
+        if ($seen.Add($c)) { $unique.Add($c) }
+    }
+
+    # Return as a plain string array, force single-item arrays to stay arrays
+    return @($unique.ToArray())
 }
 
 function Copy-IfExists {
@@ -900,7 +937,7 @@ function Copy-IfExists {
 }
 
 function Get-GameVersionInfo {
-    $installs = Find-WindroseInstall
+    $installs = @(Find-WindroseInstall)
     Write-Section 'Shipyard (Windrose installs)'
     if (-not $installs -or $installs.Count -eq 0) {
         Write-Line 'No install path auto-detected.'
@@ -908,21 +945,22 @@ function Get-GameVersionInfo {
         return @()
     }
 
-    foreach ($i in $installs) { Write-Line $i }
+    foreach ($i in $installs) { Write-Line ([string]$i) }
 
     foreach ($install in $installs) {
-        $exeCandidates = Get-ChildItem -Path $install -Recurse -Include *.exe -ErrorAction SilentlyContinue |
+        $installStr = [string]$install
+        $exeCandidates = Get-ChildItem -Path $installStr -Recurse -Include *.exe -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match 'Windrose|R5' } |
             Select-Object -First 5
 
         if ($exeCandidates) {
-            Write-Section "Hull markings in $install"
+            Write-Section "Hull markings in $installStr"
             foreach ($exe in $exeCandidates) {
                 Write-Line ("{0} | {1}" -f $exe.FullName, $exe.VersionInfo.FileVersion)
             }
-            Add-Finding -Status 'PASS' -Check 'Game install' -Details "Install and version info detected in $install."
+            Add-Finding -Status 'PASS' -Check 'Game install' -Details "Install and version info detected in $installStr."
         } else {
-            Add-Finding -Status 'WARN' -Check 'Game version' -Details "Install found at $install but no Windrose/R5 exe detected."
+            Add-Finding -Status 'WARN' -Check 'Game version' -Details "Install found at $installStr but no Windrose/R5 exe detected."
         }
     }
 

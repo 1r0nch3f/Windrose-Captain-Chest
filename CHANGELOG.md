@@ -5,6 +5,20 @@ All notable changes to Windrose Captain's Chest will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2026-04-19
+
+Fix bugs introduced by the install-detection changes in v1.0.1.
+
+### Fixed
+
+- **Doubled install paths.** The firewall-walk detection added in v1.0.1 could produce duplicate entries that weren't deduped properly (e.g., `F:\SteamLibrary\steamapps\common\WindroseF:\SteamLibrary\steamapps\common\Windrose`). Switched to a generic list with explicit case-insensitive HashSet deduplication and path normalization via `Resolve-Path`.
+- **Empty drive letter in storage check.** When the install path was garbled (see above), `.Substring(0,1)` could return an empty string, producing "Could not read drive :". Now uses a regex to extract a valid drive letter and falls back to C: if nothing sensible can be parsed.
+- **Windrose.exe not detected even when present.** Fallout from the doubled-path bug — `Get-ChildItem` was being handed a non-existent concatenated path. With dedupe fixed this now works.
+
+### Changed
+
+- `Find-WindroseInstall` now always returns a plain `string[]` array (via `@(...)` wrap), preventing PowerShell's automatic unrolling from confusing downstream callers.
+
 ## [1.0.2] - 2026-04-19
 
 Privacy feature added — safe-to-share redacted reports.
