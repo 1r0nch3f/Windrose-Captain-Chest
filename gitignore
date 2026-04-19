@@ -1,0 +1,12 @@
+# Output chests
+WindroseCaptainChest/
+*.zip
+
+# OS cruft
+Thumbs.db
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
