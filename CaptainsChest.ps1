@@ -18,11 +18,13 @@
       - Salvage:        Collected Config/SaveProfiles/ServerDescription/logs
 
     Outputs to a timestamped chest on yer Desktop:
-      - CaptainsLog.txt       - full human-readable report
-      - CaptainsLog.md        - pasteable markdown for Discord/forum
-      - Manifest.csv          - pass/warn/fail findings
-      - Salvage/              - collected game files
-      - Chest_<timestamp>.zip - the whole chest, sealed for transport
+      - CaptainsLog.txt           - full human-readable report
+      - CaptainsLog.md            - pasteable markdown for Discord/forum
+      - CaptainsLog_REDACTED.txt  - optional scrubbed copy safe to post publicly
+      - CaptainsLog_REDACTED.md   - optional scrubbed markdown version
+      - Manifest.csv              - pass/warn/fail findings
+      - Salvage/                  - collected game files
+      - Chest_<timestamp>.zip     - the whole chest, sealed for transport
 
 .PARAMETER OutputPath
     Root folder for the chest. Default: Desktop\WindroseCaptainChest
@@ -45,9 +47,17 @@
 .PARAMETER NoPause
     Don't wait for a key press at the end. Useful for automation.
 
+.PARAMETER Redact
+    Automatically create a redacted version of the report without prompting.
+    Useful for automation. Strips hostname, username, IPs, MACs, file paths.
+
+.PARAMETER NoRedactPrompt
+    Skip the "create redacted version?" prompt at the end (don't create one).
+
 .EXAMPLE
     .\CaptainsChest.ps1
     .\CaptainsChest.ps1 -ServerIP 1.2.3.4 -ServerPort 7777 -Mode Full -NoPause
+    .\CaptainsChest.ps1 -Mode LocalOnly -Redact -NoPause
 #>
 
 param(
@@ -58,7 +68,9 @@ param(
     [string]$Mode = '',
     [switch]$SkipTraceRoute,
     [switch]$SkipNetworkTests,
-    [switch]$NoPause
+    [switch]$NoPause,
+    [switch]$Redact,
+    [switch]$NoRedactPrompt
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -1079,6 +1091,191 @@ function Export-Summary {
 }
 
 # -------------------------------------------------------------------------------
+# Redaction (safe-to-post version for Discord/forums)
+# -------------------------------------------------------------------------------
+
+function New-RedactedReport {
+    <#
+        Takes a path to a full report (.txt or .md) and writes a redacted
+        version next to it with personal/identifying data replaced by
+        <REDACTED> placeholders. Keeps all diagnostic data intact.
+    #>
+    param(
+        [string]$InputPath,
+        [string]$OutputPath
+    )
+
+    if (-not (Test-Path $InputPath)) { return $false }
+
+    $content = Get-Content $InputPath -Raw
+
+    # Build set of values to scrub dynamically from this run's environment
+    $hostname = $env:COMPUTERNAME
+    $username = $env:USERNAME
+    $userPathEscaped = [regex]::Escape("C:\Users\$username")
+    $userHomeEscaped = [regex]::Escape($env:USERPROFILE)
+
+    # --- Specific values (tied to current user/machine) -----------------------
+
+    # Hostname - the most unique identifier
+    if ($hostname) {
+        $content = $content -replace [regex]::Escape($hostname), '<REDACTED_HOSTNAME>'
+    }
+
+    # Username - replace in all forms including file paths
+    if ($username) {
+        $content = $content -replace [regex]::Escape($username), '<REDACTED_USER>'
+    }
+
+    # Full user profile path (in case env var resolves differently)
+    $content = $content -replace $userHomeEscaped, 'C:\Users\<REDACTED_USER>'
+    $content = $content -replace $userPathEscaped, 'C:\Users\<REDACTED_USER>'
+
+    # --- Generic patterns -----------------------------------------------------
+
+    # Public IPv4 - any non-private IPv4 address
+    # Private ranges: 10.x, 172.16-31.x, 192.168.x, 127.x, 169.254.x
+    # Everything else is public. We check carefully to avoid redacting
+    # localhost, subnet masks, metric numbers, etc.
+    $content = [regex]::Replace($content, '\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b', {
+        param($m)
+        $ip = $m.Value
+        $parts = $ip.Split('.')
+        # Skip if any octet is >255 (not a real IP - probably a version or subnet mask)
+        foreach ($p in $parts) {
+            if ([int]$p -gt 255) { return $ip }
+        }
+        $o1 = [int]$parts[0]; $o2 = [int]$parts[1]
+        # Keep: localhost, private networks, link-local, multicast, subnet masks
+        if ($o1 -eq 0) { return $ip }                                    # 0.0.0.0
+        if ($o1 -eq 10) { return $ip }                                   # 10.x private
+        if ($o1 -eq 127) { return $ip }                                  # loopback
+        if ($o1 -eq 169 -and $o2 -eq 254) { return $ip }                 # link-local
+        if ($o1 -eq 172 -and $o2 -ge 16 -and $o2 -le 31) { return $ip }  # 172.16-31 private
+        if ($o1 -eq 192 -and $o2 -eq 168) { return $ip }                 # 192.168 private
+        if ($o1 -ge 224) { return $ip }                                  # multicast/reserved
+        if ($o1 -eq 255) { return $ip }                                  # subnet mask
+        # Well-known public DNS that's not really personal (shows up in hosts/DNS)
+        if ($ip -in @('1.1.1.1','1.0.0.1','8.8.8.8','8.8.4.4','9.9.9.9')) { return $ip }
+        return '<REDACTED_PUBLIC_IP>'
+    })
+
+    # Local IPv4 - replace 192.168.x.y and 10.x.y.z host portions but keep subnet shape
+    # Keep default gateways recognizable (usually .1 or .254) but redact specific host IPs
+    $content = [regex]::Replace($content, '\b192\.168\.\d{1,3}\.\d{1,3}\b', {
+        param($m)
+        $ip = $m.Value
+        $parts = $ip.Split('.')
+        $last = [int]$parts[3]
+        # Keep .0 (network), .1 (common gateway), .254 (common gateway), .255 (broadcast)
+        if ($last -in @(0, 1, 254, 255)) { return $ip }
+        return "192.168.$($parts[2]).<REDACTED_HOST>"
+    })
+
+    # DHCPv6 DUID - Windows-format includes MAC. IMPORTANT: must run BEFORE the
+    # MAC regex below, otherwise MAC substitutions break the DUID pattern.
+    $content = $content -replace 'DHCPv6 Client DUID[\.\s]*:\s*[\w\-]+', 'DHCPv6 Client DUID . . . . . . . . : <REDACTED_DUID>'
+    $content = $content -replace 'DHCPv6 IAID[\.\s]*:\s*\d+', 'DHCPv6 IAID . . . . . . . . . . . : <REDACTED_IAID>'
+
+    # DHCP lease dates - match Windows' actual format which uses variable dot spacing
+    $content = $content -replace '(Lease (?:Obtained|Expires)[\.\s]*:\s*)[A-Za-z]+,\s*[A-Za-z]+\s+\d+,\s*\d+\s+\d+:\d+:\d+\s*[AP]M', '$1<REDACTED_LEASE_TIME>'
+
+    # MAC addresses - both hyphen and colon forms (must run AFTER DUID scrubbing)
+    $content = $content -replace '\b([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b', '<REDACTED_MAC>'
+
+    # IPv6 - link-local and globals
+    # Link-local fe80::/10 - redact interface ID portion
+    $content = $content -replace 'fe80::[0-9a-fA-F:]+', 'fe80::<REDACTED>'
+    # Any other IPv6 global - full redact (conservative)
+    $content = $content -replace '\b(?:[0-9a-fA-F]{1,4}:){3,7}[0-9a-fA-F]{1,4}\b', {
+        param($m)
+        $v = $m.Value
+        if ($v -match '^(fe80|::1|::)' -or $v -eq '::1') { return $v }
+        return '<REDACTED_IPV6>'
+    }
+
+    # --- File paths - strip drive paths with user folder references -----------
+    # F:\SteamLibrary\... and similar are OK (hardware layout is useful to helpers)
+    # C:\Users\<anyone>\... is not
+    $content = $content -replace '([A-Z]:\\Users\\)[^\\\s]+', '$1<REDACTED_USER>'
+
+    # --- Banner / header ------------------------------------------------------
+    # Add a notice at the top so anyone reading knows this is scrubbed
+    $banner = @"
+===============================================================================
+  REDACTED REPORT - safe to share
+  Personal data (hostname, username, public IP, MAC, etc.) has been replaced
+  with <REDACTED_*> placeholders. Hardware and diagnostic data preserved.
+  Generated: $(Get-Date)
+===============================================================================
+
+"@
+
+    # Only prepend banner to text reports, not markdown (markdown has its own
+    # structure that's cleaner to edit below)
+    if ($OutputPath -match '\.txt$') {
+        $content = $banner + $content
+    } else {
+        # For markdown: insert a warning callout after the title
+        $content = $content -replace '(?m)^(# Windrose Captain.*?\r?\n)', @"
+`$1
+> ⚠️ **Redacted for sharing.** Personal data (hostname, username, public IP, MAC, etc.) has been replaced with `<REDACTED_*>` placeholders. Hardware and diagnostic data preserved.
+
+"@
+    }
+
+    Set-Content -Path $OutputPath -Value $content -Force
+    return $true
+}
+
+function Invoke-RedactionFlow {
+    <#
+        Runs after the normal Export-Summary. Either creates the redacted
+        copy automatically (if -Redact passed), asks the user (default),
+        or skips entirely (if -NoRedactPrompt passed).
+    #>
+
+    $shouldCreate = $false
+
+    if ($NoRedactPrompt) {
+        return
+    } elseif ($Redact) {
+        $shouldCreate = $true
+    } else {
+        Write-Host ''
+        Write-Host 'Redaction option' -ForegroundColor Green
+        Write-Host 'Create a redacted version of the report with personal data scrubbed?'
+        Write-Host 'Useful for posting in Discord or forums when asking for help.'
+        Write-Host 'Strips: hostname, username, public IP, MAC addresses, file paths.'
+        $answer = Read-Host 'Create redacted copy? (Y/n)'
+        if ([string]::IsNullOrWhiteSpace($answer) -or $answer -match '^[Yy]') {
+            $shouldCreate = $true
+        }
+    }
+
+    if (-not $shouldCreate) { return }
+
+    $redactedTxt = Join-Path $script:RootOut 'CaptainsLog_REDACTED.txt'
+    $redactedMd  = Join-Path $script:RootOut 'CaptainsLog_REDACTED.md'
+
+    $okTxt = New-RedactedReport -InputPath $script:ReportFile   -OutputPath $redactedTxt
+    $okMd  = New-RedactedReport -InputPath $script:MarkdownFile -OutputPath $redactedMd
+
+    # Rebuild the zip to include the new redacted files
+    $zipPath = "$script:RootOut.zip"
+    if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+    Compress-Archive -Path "$script:RootOut\*" -DestinationPath $zipPath -Force
+
+    Write-Section 'Redacted versions created'
+    if ($okTxt) { Write-Line "Redacted TXT:  $redactedTxt" }
+    if ($okMd)  { Write-Line "Redacted MD:   $redactedMd" }
+    Write-Line ''
+    Write-Line 'Post the REDACTED version (not CaptainsLog.txt) when sharing publicly.'
+    Write-Line 'Quick review before posting: open it in Notepad and skim for anything'
+    Write-Line 'that looks personal - the regex catches common things but no tool is perfect.'
+}
+
+# -------------------------------------------------------------------------------
 # Main
 # -------------------------------------------------------------------------------
 
@@ -1157,6 +1354,8 @@ switch ($selectedMode) {
 }
 
 Export-Summary
+
+Invoke-RedactionFlow
 
 Write-Host ''
 Write-Host "Chest sealed: $script:RootOut.zip" -ForegroundColor Yellow

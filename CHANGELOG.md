@@ -5,6 +5,21 @@ All notable changes to Windrose Captain's Chest will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-04-19
+
+Privacy feature added — safe-to-share redacted reports.
+
+### Added
+
+- **Redacted report output.** At the end of every run, the script now prompts "Create redacted copy? (Y/n)". Answering yes produces `CaptainsLog_REDACTED.txt` and `CaptainsLog_REDACTED.md` alongside the full reports, with personal/identifying data replaced by `<REDACTED_*>` placeholders. All diagnostic data (OS, hardware, Seaworthy findings, port tests, firewall state, etc.) is preserved. The redacted files get added to the sealed zip.
+- **What gets scrubbed:** hostname, username (in all forms including file paths), public IPv4/IPv6 addresses, MAC addresses, DHCPv6 DUID/IAID, local host IPs (keeps network shape like `192.168.1.<REDACTED_HOST>` so gateway structure is still visible), DHCP lease timestamps, user profile paths.
+- **What's preserved:** OS version/build, CPU/RAM/GPU details, VRAM, driver versions, Seaworthy PASS/WARN/FAIL findings, port test results (without target IP), Steam/Windrose process names, firewall profile state, VC++ runtimes, install drive layout (e.g., `F:\SteamLibrary\...`), well-known public DNS servers (1.1.1.1, 8.8.8.8).
+- **Automation flags:** `-Redact` creates the redacted version automatically without prompting. `-NoRedactPrompt` skips the prompt entirely.
+
+### Notes
+
+Regex-based redaction is never perfect. The script adds a notice at the top of redacted files reminding users to skim once before posting, in case anything specific to their setup slipped through.
+
 ## [1.0.1] - 2026-04-19
 
 Bug-fix release. Four real-world issues surfaced by first-run testing.

@@ -67,9 +67,13 @@ Inside you'll find:
 |------|---------|
 | `CaptainsLog.txt` | Full human-readable report |
 | `CaptainsLog.md` | Markdown findings table — paste straight into Discord |
+| `CaptainsLog_REDACTED.txt` | **Safe-to-share** copy with hostname/username/IPs/MACs scrubbed |
+| `CaptainsLog_REDACTED.md` | Safe-to-share markdown version |
 | `Manifest.csv` | PASS/WARN/FAIL/INFO findings, one per row |
 | `Salvage/` | Recovered game configs and logs |
 | `...zip` | The whole chest sealed for transport, next to the folder |
+
+At the end of every run, you'll be asked whether to create the redacted copies. Post those (not the full log) when asking for help in public channels — they keep all the diagnostic data a helper needs while hiding your hostname, public IP, MAC addresses, and file paths behind `<REDACTED_*>` placeholders.
 
 ---
 
@@ -144,6 +148,8 @@ You'll be prompted to chart a course:
 | `-SkipTraceRoute` | Skip tracert (saves ~30s) | off |
 | `-SkipNetworkTests` | Skip all remote tests and public IP lookup | off |
 | `-NoPause` | Don't wait for Enter at the end | off |
+| `-Redact` | Auto-create redacted copy without prompting | off |
+| `-NoRedactPrompt` | Skip the redacted-copy prompt entirely | off |
 
 ---
 
