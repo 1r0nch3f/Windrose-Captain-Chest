@@ -75,13 +75,49 @@ Inside you'll find:
 
 ## 🧭 Usage
 
-### Hoist sail (interactive)
+### Hoist sail (easiest — compiled exe)
 
-Right-click the script → **Run with PowerShell**, or from a PowerShell window:
+Double-click `CaptainsChest.exe`.
+
+On first run you'll see a few Windows prompts. **This is normal for unsigned community tools** — work through them and it'll stick for future runs:
+
+1. **Windows Defender SmartScreen** — "Windows protected your PC"
+   Click **More info** → **Run anyway**
+2. **User Account Control (UAC)** — "Do you want to allow this app to make changes?"
+   Click **Yes** (admin is needed for full firewall and event log access)
+3. The pirate banner appears — chart yer course and follow the prompts
+
+### ⚠️ Why does SmartScreen / my antivirus complain?
+
+The exe is a PowerShell script compiled with a tool called `ps2exe`. Because some malware authors use the same tool, **Windows Defender and other AV products sometimes flag `ps2exe` output as a false positive**. Typical warnings:
+
+- SmartScreen: "Windows protected your PC" (one-click past it)
+- Defender: "Trojan:Win32/Wacatac" (false positive)
+- Some AVs may silently quarantine or delete the file
+
+**If you don't want to trust the exe, don't!** The source `CaptainsChest.ps1` is in the same zip. Open it in Notepad, read every line, and if it looks clean, run the `.ps1` directly:
 
 ```powershell
-.\CaptainsChest.ps1
+powershell -ExecutionPolicy Bypass -File .\CaptainsChest.ps1
 ```
+
+The source being right there is the point — this is a community tool, not a black box.
+
+### Alternative: run the .ps1 directly
+
+If you'd rather skip the exe entirely:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\CaptainsChest.ps1
+```
+
+Or unblock the file once and right-click → Run with PowerShell will work forever after:
+
+```powershell
+Unblock-File .\CaptainsChest.ps1
+```
+
+### Picking a mode
 
 You'll be prompted to chart a course:
 
@@ -92,9 +128,9 @@ You'll be prompted to chart a course:
 ### Non-interactive (scripted)
 
 ```powershell
-.\CaptainsChest.ps1 -Mode Full -ServerIP 1.2.3.4 -ServerPort 7777 -NoPause
-.\CaptainsChest.ps1 -Mode LocalOnly -NoPause
-.\CaptainsChest.ps1 -Mode Full -ServerIP crew.example.com -SkipTraceRoute -NoPause
+.\CaptainsChest.exe -Mode Full -ServerIP 1.2.3.4 -ServerPort 7777 -NoPause
+.\CaptainsChest.exe -Mode LocalOnly -NoPause
+.\CaptainsChest.exe -Mode Full -ServerIP crew.example.com -SkipTraceRoute -NoPause
 ```
 
 ### Parameters
@@ -111,25 +147,10 @@ You'll be prompted to chart a course:
 
 ---
 
-## 🔒 Execution policy
-
-If PowerShell refuses to run the script, hoist the bypass flag:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\CaptainsChest.ps1
-```
-
-Or unblock the file once after downloading:
-
-```powershell
-Unblock-File .\CaptainsChest.ps1
-```
-
----
-
 ## 👮 Admin rights
 
-Not required, but **recommended**. Without admin you'll miss some firewall rule details and a chunk of event log entries. The report tells you its admin state up top so the dockmaster knows what's in the manifest.
+- **Running the `.exe`**: automatically prompts for admin via UAC. Click Yes.
+- **Running the `.ps1` directly**: not required, but recommended. Without admin you'll miss some firewall rule details and a chunk of event log entries. The report tells you its admin state up top so the dockmaster knows what's in the manifest.
 
 ---
 
