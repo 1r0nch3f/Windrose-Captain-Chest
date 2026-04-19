@@ -17,6 +17,16 @@ A standalone PowerShell toolkit that gathers everything you'd want to know about
 - Name, driver version, VRAM
 - Driver date and **age warning** — flags drivers over 6 months (INFO) or 12 months (WARN)
 
+**Seaworthy check ⚓**
+- Compares yer ship against Windrose's minimum and recommended specs
+- **OS** — 64-bit check, Win10 (min) / Win11 (recommended)
+- **CPU** — cores and clock speed vs i7-8700K (min) / i7-10700 (rec)
+- **RAM** — 16 GB (min) / 32 GB (rec)
+- **GPU** — tiered lookup table covering NVIDIA/AMD cards from GTX 900-series through RTX 50-series and RX 9000, with a "manual review" fallback for unknown cards
+- **DirectX** — queries `dxdiag` for the version (needs DX12)
+- **Storage** — checks free space on the Windrose install drive (or C: if not installed), 30 GB required
+- **SSD detection** — warns if yer game drive is an HDD (Windrose strongly recommends SSD)
+
 **Soundings (network)**
 - Adapters, link speed, IP config, route table
 - Home waters (local network profile: Public vs Private)
@@ -147,6 +157,21 @@ Tested by default whenever you supply a target. Edit the `$script:WindrosePortPr
 | 7778 | UDP | Secondary game port |
 | 27015 | UDP/TCP | Steam query / master |
 | 27036 | UDP/TCP | Steam streaming / P2P |
+
+---
+
+## 📋 Windrose system requirements (what Seaworthy checks against)
+
+| Spec | Minimum | Recommended |
+|---|---|---|
+| OS | Windows 10 (64-bit) | Windows 11 (64-bit) |
+| CPU | Intel i7-8700K / AMD Ryzen 7 2700X | Intel i7-10700 / AMD Ryzen 7 5800X |
+| RAM | 16 GB | 32 GB |
+| GPU | NVIDIA GTX 1080 Ti / AMD RX 6800 | NVIDIA RTX 3080 / AMD RX 6800 XT |
+| DirectX | 12 | 12 |
+| Storage | 30 GB (SSD recommended) | 30 GB (SSD required) |
+
+The developers note that Windrose is in Early Access and these numbers are **not final**. Self-hosted servers need additional RAM on top. If the game updates its specs, edit `$script:WindroseSpecs` at the top of the script.
 
 ---
 

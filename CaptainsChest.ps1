@@ -7,6 +7,8 @@
     single pasteable report covering:
 
       - Ship's papers:  OS, CPU, RAM, GPU (with driver age check)
+      - Seaworthy:      Spec check vs Windrose min/recommended (CPU, RAM, GPU,
+                        DirectX, disk space, SSD detection)
       - Soundings:      Network adapters, local IP, public IP
       - Hold inventory: Windrose install detection and executable versions
       - Watch posts:    Firewall profile and Steam/Windrose rules
@@ -68,6 +70,89 @@ $script:WindrosePortPresets = @(
     [pscustomobject]@{ Port = 7778;  Protocol = 'UDP';     Purpose = 'Secondary game port' }
     [pscustomobject]@{ Port = 27015; Protocol = 'UDP/TCP'; Purpose = 'Steam query / master' }
     [pscustomobject]@{ Port = 27036; Protocol = 'UDP/TCP'; Purpose = 'Steam streaming / P2P' }
+)
+
+# --- Windrose system requirements (edit if the game updates these) -------------
+# Source: windrosewiki.org/requirements as of April 2026.
+# Numbers are "not final and subject to change" per the developers.
+$script:WindroseSpecs = @{
+    OS = @{
+        MinBuild = 19041  # Windows 10 20H1 - any Win10/11 64-bit is fine
+        MinName  = 'Windows 10 64-bit'
+        RecName  = 'Windows 11 64-bit'
+    }
+    CPU = @{
+        MinCores  = 6       # i7-8700K / Ryzen 7 2700X have 6-8 cores, both hit 6
+        RecCores  = 8       # i7-10700 / Ryzen 7 5800X both have 8 cores
+        MinGhz    = 3.2
+        RecGhz    = 3.8
+        MinName   = 'Intel i7-8700K / AMD Ryzen 7 2700X'
+        RecName   = 'Intel i7-10700 / AMD Ryzen 7 5800X'
+    }
+    RAM = @{
+        MinGB = 16
+        RecGB = 32
+    }
+    GPU = @{
+        # GPU tier lookup - higher number = better card
+        # Min = GTX 1080 Ti / RX 6800 (tier 5)
+        # Rec = RTX 3080 / RX 6800 XT  (tier 6)
+        MinTier = 5
+        RecTier = 6
+        MinName = 'NVIDIA GTX 1080 Ti / AMD Radeon RX 6800'
+        RecName = 'NVIDIA RTX 3080 / AMD Radeon RX 6800 XT'
+        MinVramGB = 8
+        RecVramGB = 10
+    }
+    DirectX = @{
+        MinVersion = 12
+        RecVersion = 12
+    }
+    Storage = @{
+        MinFreeGB = 30
+        RecFreeGB = 30
+        SsdRequired = $false  # "strongly recommended" for min, "required" for rec
+    }
+}
+
+# GPU tier table - maps detected GPU name patterns to a performance tier.
+# Tiers: 0=below min, 1=very old, 2=low-mid, 3=mid, 4=upper-mid, 5=min spec, 6=rec spec, 7=above rec
+$script:GpuTierTable = @(
+    # --- Tier 7: above recommended ---
+    @{ Pattern = 'RTX\s*(4070|4080|4090|5070|5080|5090)'; Tier = 7; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RTX\s*(3080|3090)\s*Ti';                Tier = 7; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RX\s*(7800|7900|9070|9080)';            Tier = 7; Vendor = 'AMD' }
+
+    # --- Tier 6: recommended ---
+    @{ Pattern = 'RTX\s*(3080|3090)';                     Tier = 6; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RTX\s*(4060\s*Ti|4070)';                Tier = 6; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RX\s*(6800\s*XT|6900|7700|7800)';       Tier = 6; Vendor = 'AMD' }
+
+    # --- Tier 5: minimum ---
+    @{ Pattern = 'GTX\s*1080\s*Ti';                       Tier = 5; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RTX\s*(2080|3060\s*Ti|3070|4060)';      Tier = 5; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RX\s*(6700\s*XT|6800|5700\s*XT|7600)';  Tier = 5; Vendor = 'AMD' }
+
+    # --- Tier 4: upper-mid (below min but close) ---
+    @{ Pattern = 'RTX\s*(2060|2070|3050|3060)';           Tier = 4; Vendor = 'NVIDIA' }
+    @{ Pattern = 'GTX\s*(1080|1070\s*Ti)';                Tier = 4; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RX\s*(5700|6600|6700|5600\s*XT)';       Tier = 4; Vendor = 'AMD' }
+
+    # --- Tier 3: mid ---
+    @{ Pattern = 'GTX\s*(1070|1660|1060\s*6GB)';          Tier = 3; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RX\s*(580|590|5500\s*XT|6500\s*XT)';    Tier = 3; Vendor = 'AMD' }
+
+    # --- Tier 2: low-mid ---
+    @{ Pattern = 'GTX\s*(1050|1060|1650)';                Tier = 2; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RX\s*(470|480|570|560)';                Tier = 2; Vendor = 'AMD' }
+
+    # --- Tier 1: very old ---
+    @{ Pattern = 'GTX\s*(9[56]0|10[45]0|750|760|770|780)'; Tier = 1; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RX\s*(460|550|460)';                    Tier = 1; Vendor = 'AMD' }
+
+    # --- Tier 0: definitely below min ---
+    @{ Pattern = '(UHD|Iris|HD)\s*Graphics';              Tier = 0; Vendor = 'Intel iGPU' }
+    @{ Pattern = 'Vega\s*\d+';                            Tier = 0; Vendor = 'AMD iGPU' }
 )
 
 $script:RootOut      = $null
@@ -261,6 +346,220 @@ function Get-GpuInfoWithDriverAge {
         Write-Line ("VRAM (GB):      {0}" -f $ramGB)
         Write-Line ''
     }
+}
+
+# -------------------------------------------------------------------------------
+# Seaworthy check (min/recommended spec comparison)
+# -------------------------------------------------------------------------------
+
+function Get-GpuTier {
+    param([string]$GpuName)
+
+    if ([string]::IsNullOrWhiteSpace($GpuName)) { return -1 }
+
+    foreach ($entry in $script:GpuTierTable) {
+        if ($GpuName -match $entry.Pattern) {
+            return $entry.Tier
+        }
+    }
+    return -1  # unknown
+}
+
+function Get-DirectXVersion {
+    try {
+        $tempFile = Join-Path $env:TEMP "dxdiag_$(Get-Random).txt"
+        Start-Process -FilePath 'dxdiag' -ArgumentList "/t `"$tempFile`"" -Wait -NoNewWindow -ErrorAction Stop
+        # dxdiag runs async sometimes - give it a moment
+        $waited = 0
+        while (-not (Test-Path $tempFile) -and $waited -lt 10) {
+            Start-Sleep -Seconds 1
+            $waited++
+        }
+        if (Test-Path $tempFile) {
+            $content = Get-Content $tempFile -Raw
+            Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+            if ($content -match 'DirectX Version:\s*DirectX\s+(\d+)') {
+                return [int]$matches[1]
+            }
+        }
+    } catch { }
+    return $null
+}
+
+function Get-SystemDriveIsSSD {
+    param([string]$DriveLetter = 'C')
+    try {
+        $partition = Get-Partition -DriveLetter $DriveLetter -ErrorAction Stop
+        $disk = Get-PhysicalDisk | Where-Object { $_.DeviceId -eq $partition.DiskNumber }
+        if ($disk) {
+            return ($disk.MediaType -eq 'SSD')
+        }
+    } catch { }
+    return $null  # unknown
+}
+
+function Test-Seaworthy {
+    Write-Section 'Seaworthy check (minimum/recommended specs)'
+    $specs = $script:WindroseSpecs
+
+    Write-Line 'Comparing yer ship against the Windrose requirements.'
+    Write-Line ("  Minimum:      CPU {0}, {1} GB RAM, {2}" -f $specs.CPU.MinName, $specs.RAM.MinGB, $specs.GPU.MinName)
+    Write-Line ("  Recommended:  CPU {0}, {1} GB RAM, {2}" -f $specs.CPU.RecName, $specs.RAM.RecGB, $specs.GPU.RecName)
+    Write-Line ''
+
+    # --- OS check ---
+    $os = Get-CimInstance Win32_OperatingSystem
+    $osArch = $os.OSArchitecture
+    $osBuild = [int]($os.BuildNumber)
+    $is64bit = $osArch -match '64'
+    $osDisplay = "$($os.Caption) (build $osBuild, $osArch)"
+    Write-Line ("OS:      {0}" -f $osDisplay)
+
+    if (-not $is64bit) {
+        Write-Line '         [FAIL] Windrose requires a 64-bit OS.'
+        Add-Finding -Status 'FAIL' -Check 'Seaworthy: OS' -Details "64-bit required. Detected: $osArch"
+    } elseif ($osBuild -ge 22000) {
+        Write-Line '         [PASS-REC] Meets recommended (Windows 11).'
+        Add-Finding -Status 'PASS' -Check 'Seaworthy: OS' -Details "Meets recommended ($osDisplay)."
+    } elseif ($osBuild -ge $specs.OS.MinBuild) {
+        Write-Line '         [PASS-MIN] Meets minimum (Windows 10 64-bit).'
+        Add-Finding -Status 'PASS' -Check 'Seaworthy: OS' -Details "Meets minimum ($osDisplay)."
+    } else {
+        Write-Line '         [FAIL] Below minimum Windows 10 build.'
+        Add-Finding -Status 'FAIL' -Check 'Seaworthy: OS' -Details "Below minimum. Detected: $osDisplay"
+    }
+
+    # --- CPU check ---
+    $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+    $cpuCores = [int]$cpu.NumberOfCores
+    $cpuGhz = [math]::Round($cpu.MaxClockSpeed / 1000.0, 2)
+    Write-Line ("CPU:     {0} ({1} cores @ {2} GHz)" -f $cpu.Name.Trim(), $cpuCores, $cpuGhz)
+
+    if ($cpuCores -ge $specs.CPU.RecCores -and $cpuGhz -ge $specs.CPU.RecGhz) {
+        Write-Line '         [PASS-REC] Meets recommended CPU.'
+        Add-Finding -Status 'PASS' -Check 'Seaworthy: CPU' -Details "Meets recommended ($cpuCores cores, $cpuGhz GHz)."
+    } elseif ($cpuCores -ge $specs.CPU.MinCores -and $cpuGhz -ge $specs.CPU.MinGhz) {
+        Write-Line '         [PASS-MIN] Meets minimum CPU.'
+        Add-Finding -Status 'PASS' -Check 'Seaworthy: CPU' -Details "Meets minimum ($cpuCores cores, $cpuGhz GHz). Recommended: $($specs.CPU.RecCores) cores, $($specs.CPU.RecGhz)+ GHz."
+    } else {
+        Write-Line '         [FAIL] Below minimum CPU.'
+        Add-Finding -Status 'FAIL' -Check 'Seaworthy: CPU' -Details "Below minimum ($cpuCores cores, $cpuGhz GHz). Min: $($specs.CPU.MinCores) cores, $($specs.CPU.MinGhz)+ GHz."
+    }
+
+    # --- RAM check ---
+    $ramBytes = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
+    $ramGB = [math]::Round($ramBytes / 1GB, 2)
+    Write-Line ("RAM:     {0} GB" -f $ramGB)
+
+    if ($ramGB -ge $specs.RAM.RecGB) {
+        Write-Line '         [PASS-REC] Meets recommended RAM.'
+        Add-Finding -Status 'PASS' -Check 'Seaworthy: RAM' -Details "Meets recommended ($ramGB GB)."
+    } elseif ($ramGB -ge $specs.RAM.MinGB) {
+        Write-Line ('         [PASS-MIN] Meets minimum. Recommended is {0} GB.' -f $specs.RAM.RecGB)
+        Add-Finding -Status 'PASS' -Check 'Seaworthy: RAM' -Details "Meets minimum ($ramGB GB). Recommended: $($specs.RAM.RecGB) GB."
+    } else {
+        Write-Line '         [FAIL] Below minimum RAM.'
+        Add-Finding -Status 'FAIL' -Check 'Seaworthy: RAM' -Details "Below minimum ($ramGB GB). Min: $($specs.RAM.MinGB) GB."
+    }
+
+    # --- GPU check ---
+    $gpus = Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic|Remote|Meta|Mirror' }
+    $bestTier = -1
+    $bestGpu = $null
+    foreach ($g in $gpus) {
+        $tier = Get-GpuTier -GpuName $g.Name
+        if ($tier -gt $bestTier) {
+            $bestTier = $tier
+            $bestGpu = $g
+        }
+    }
+
+    if ($bestGpu) {
+        $vramGB = if ($bestGpu.AdapterRAM) { [math]::Round($bestGpu.AdapterRAM / 1GB, 2) } else { $null }
+        $vramDisplay = if ($vramGB) { "$vramGB GB VRAM" } else { 'VRAM unknown' }
+        Write-Line ("GPU:     {0} ({1})" -f $bestGpu.Name, $vramDisplay)
+
+        if ($bestTier -eq -1) {
+            Write-Line '         [MANUAL] Could not auto-classify this GPU. Compare manually to the requirements above.'
+            Add-Finding -Status 'INFO' -Check 'Seaworthy: GPU' -Details "GPU '$($bestGpu.Name)' not in lookup table - check manually against $($specs.GPU.MinName) / $($specs.GPU.RecName)."
+        } elseif ($bestTier -ge $specs.GPU.RecTier) {
+            Write-Line '         [PASS-REC] Meets recommended GPU tier.'
+            Add-Finding -Status 'PASS' -Check 'Seaworthy: GPU' -Details "$($bestGpu.Name) meets recommended tier."
+        } elseif ($bestTier -ge $specs.GPU.MinTier) {
+            Write-Line '         [PASS-MIN] Meets minimum GPU tier.'
+            Add-Finding -Status 'PASS' -Check 'Seaworthy: GPU' -Details "$($bestGpu.Name) meets minimum tier. Recommended: $($specs.GPU.RecName)."
+        } else {
+            Write-Line '         [FAIL] Below minimum GPU tier.'
+            Add-Finding -Status 'FAIL' -Check 'Seaworthy: GPU' -Details "$($bestGpu.Name) below minimum. Min: $($specs.GPU.MinName)."
+        }
+    } else {
+        Write-Line 'GPU:     no suitable adapter detected'
+        Add-Finding -Status 'WARN' -Check 'Seaworthy: GPU' -Details 'No GPU detected or only basic/virtual adapters present.'
+    }
+
+    # --- DirectX check ---
+    Write-Line ''
+    Write-Line 'DirectX: querying dxdiag (this takes a few seconds)...'
+    $dxVersion = Get-DirectXVersion
+    if ($dxVersion) {
+        Write-Line ("         DirectX {0} detected" -f $dxVersion)
+        if ($dxVersion -ge $specs.DirectX.MinVersion) {
+            Write-Line '         [PASS] Meets DirectX requirement.'
+            Add-Finding -Status 'PASS' -Check 'Seaworthy: DirectX' -Details "DirectX $dxVersion (required: $($specs.DirectX.MinVersion))."
+        } else {
+            Write-Line '         [FAIL] Below minimum DirectX version.'
+            Add-Finding -Status 'FAIL' -Check 'Seaworthy: DirectX' -Details "DirectX $dxVersion detected. Required: $($specs.DirectX.MinVersion)."
+        }
+    } else {
+        Write-Line '         [UNKNOWN] Could not parse DirectX version from dxdiag.'
+        Add-Finding -Status 'INFO' -Check 'Seaworthy: DirectX' -Details "DirectX version could not be determined via dxdiag."
+    }
+
+    # --- Storage check ---
+    Write-Line ''
+    $targetDrive = $null
+    $installs = Find-WindroseInstall
+    if ($installs -and $installs.Count -gt 0) {
+        $targetDrive = ($installs[0]).Substring(0,1)
+        Write-Line ("Storage: checking drive {0}: (Windrose install drive)" -f $targetDrive)
+    } else {
+        $targetDrive = 'C'
+        Write-Line 'Storage: checking drive C: (no Windrose install found - default)'
+    }
+
+    $drive = Get-PSDrive -Name $targetDrive -ErrorAction SilentlyContinue
+    if ($drive) {
+        $freeGB = [math]::Round($drive.Free / 1GB, 2)
+        Write-Line ("         Free space: {0} GB" -f $freeGB)
+
+        if ($freeGB -ge $specs.Storage.RecFreeGB) {
+            Write-Line ('         [PASS] Meets {0} GB requirement.' -f $specs.Storage.MinFreeGB)
+            Add-Finding -Status 'PASS' -Check 'Seaworthy: Storage' -Details "$freeGB GB free on $($targetDrive): (need $($specs.Storage.MinFreeGB) GB)."
+        } else {
+            Write-Line ('         [FAIL] Below {0} GB requirement.' -f $specs.Storage.MinFreeGB)
+            Add-Finding -Status 'FAIL' -Check 'Seaworthy: Storage' -Details "Only $freeGB GB free on $($targetDrive):. Need $($specs.Storage.MinFreeGB) GB."
+        }
+
+        # SSD check
+        $isSsd = Get-SystemDriveIsSSD -DriveLetter $targetDrive
+        if ($isSsd -eq $true) {
+            Write-Line '         [PASS] SSD detected (recommended).'
+            Add-Finding -Status 'PASS' -Check 'Seaworthy: SSD' -Details "Drive $($targetDrive): is an SSD."
+        } elseif ($isSsd -eq $false) {
+            Write-Line '         [WARN] HDD detected - SSD is strongly recommended for Windrose.'
+            Add-Finding -Status 'WARN' -Check 'Seaworthy: SSD' -Details "Drive $($targetDrive): is an HDD. SSD strongly recommended."
+        } else {
+            Write-Line '         [UNKNOWN] Could not determine drive type.'
+            Add-Finding -Status 'INFO' -Check 'Seaworthy: SSD' -Details "Could not determine if drive $($targetDrive): is SSD or HDD."
+        }
+    } else {
+        Write-Line '         [WARN] Could not read drive info.'
+        Add-Finding -Status 'WARN' -Check 'Seaworthy: Storage' -Details "Could not read drive $($targetDrive):"
+    }
+
+    Write-Line ''
+    Write-Line 'Note: Windrose is in Early Access - the developers state that requirements are'
+    Write-Line 'not final. For self-hosted servers, add RAM on top of these numbers.'
 }
 
 # -------------------------------------------------------------------------------
@@ -674,6 +973,7 @@ $selectedMode = Prompt-Menu
 Get-OsInfo
 Get-CpuAndMemory
 Get-GpuInfoWithDriverAge
+Test-Seaworthy
 Get-LocalNetworkSummary
 Run-CommandCapture -Label 'Rigging (network adapters)' -Command {
     Get-NetAdapter | Sort-Object Status, Name |
