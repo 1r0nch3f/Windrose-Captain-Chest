@@ -3,14 +3,23 @@ setlocal enabledelayedexpansion
 
 REM ============================================================
 REM  Windrose Captain's Chest - one-click release
-REM  Creates a git tag, pushes it, builds a clean distribution
-REM  zip, and (if gh CLI is installed) publishes the release.
+REM  Prompts for version at runtime so release.bat never needs
+REM  manual editing for each new release.
 REM ============================================================
 
-set "VERSION=v1.3.0"
 set "REPO=1r0nch3f/Windrose-Captain-Chest"
-set "DIST_ZIP=CaptainsChest-%VERSION%.zip"
 set "DIST_DIR=_dist"
+
+set /p VERSION="Enter version tag (example: v1.3.1): "
+if "%VERSION%"=="" (
+    echo [ERROR] No version entered.
+    echo Aborted.
+    echo.
+    pause
+    exit /b 1
+)
+
+set "DIST_ZIP=CaptainsChest-%VERSION%.zip"
 
 echo.
 echo ============================================================
@@ -110,17 +119,13 @@ echo [5/6] Building distribution zip...
 if exist "%DIST_DIR%" rmdir /s /q "%DIST_DIR%"
 mkdir "%DIST_DIR%"
 
-REM Always include README, LICENSE, CHANGELOG
-copy /y "README.md"         "%DIST_DIR%\" >nul
-copy /y "LICENSE"           "%DIST_DIR%\" >nul
-copy /y "CHANGELOG.md"      "%DIST_DIR%\" >nul
+copy /y "README.md"    "%DIST_DIR%\" >nul
+copy /y "LICENSE"      "%DIST_DIR%\" >nul
+copy /y "CHANGELOG.md" "%DIST_DIR%\" >nul
 
-REM Prefer the compiled exe if it exists (one-click for users).
-REM Otherwise fall back to the .ps1 script.
 if exist "CaptainsChest.exe" (
     echo       Including CaptainsChest.exe (compiled, one-click)
     copy /y "CaptainsChest.exe" "%DIST_DIR%\" >nul
-    REM Also include the .ps1 so users can inspect the source if they want
     copy /y "CaptainsChest.ps1" "%DIST_DIR%\" >nul
 ) else (
     echo       No CaptainsChest.exe found - including .ps1 only.
@@ -130,7 +135,6 @@ if exist "CaptainsChest.exe" (
 
 if exist "%DIST_ZIP%" del /q "%DIST_ZIP%"
 
-REM Use PowerShell to zip (built into every modern Windows)
 powershell -NoProfile -Command "Compress-Archive -Path '%DIST_DIR%\*' -DestinationPath '%DIST_ZIP%' -Force"
 if errorlevel 1 goto fail
 
@@ -162,7 +166,6 @@ if errorlevel 1 (
 
 echo       gh CLI detected. Publishing...
 
-REM Check gh is authenticated
 gh auth status >nul 2>nul
 if errorlevel 1 (
     echo.
@@ -172,7 +175,6 @@ if errorlevel 1 (
     goto done
 )
 
-REM Create the release
 if exist "RELEASE_NOTES.md" (
     gh release create %VERSION% "%DIST_ZIP%" --repo %REPO% --title "Windrose Captain's Chest %VERSION%" --notes-file RELEASE_NOTES.md
 ) else (
@@ -201,11 +203,10 @@ echo   Something went wrong. Scroll up for the error.
 echo ============================================================
 echo.
 echo Common fixes:
-echo   - "tag already exists"     : say Y when prompted to recreate it
+echo   - "tag already exists"     : choose Y only if replacing same tag
 echo   - "Authentication failed"  : run 'git push' manually once to prime creds
 echo   - "gh: command not found"  : install from https://cli.github.com/
-echo                                or finish the release on the web (instructions
-echo                                print above if gh is missing)
+echo                                or finish the release on the web
 echo.
 pause
 exit /b 1
