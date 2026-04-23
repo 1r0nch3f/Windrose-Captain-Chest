@@ -2,54 +2,39 @@
 
 > *"A sturdy chest for any Windrose captain — full of logs, charts, and soundings to hand the port authority when things go sideways."*
 
-A standalone PowerShell toolkit that gathers everything you'd want to know about a Windrose crew's rig in one pasteable report. Run it once, open the chest, hand the contents to whoever's helping you debug.
+A standalone PowerShell toolkit focused on the one thing that actually causes Windrose issues: networking. Run it once, open the chest, hand the contents to whoever's helping you debug.
 
 ---
 
 ## ⚓ What's in the chest
 
-**Ship's papers**
-- Windows version, build, architecture
-- CPU (model, cores, clock)
-- RAM (total GB)
+### Connection Trouble (the 90% case)
 
-**Crow's nest (GPU)**
-- Name, driver version, VRAM
-- Driver date and **age warning** — flags drivers over 6 months (INFO) or 12 months (WARN)
+- **Port authority** — detects your ISP automatically and matches it against a table of known culprits, telling you exactly which router security feature to toggle off and where to find it
+- **Fleet check** — probes all 8 Windrose backend endpoints (dual DNS, TCP) and diagnoses ISP blocks, DNS spoofing, IPv6 issues, or a genuine outage
+- **Windows Firewall** — checks active profiles and Windrose/Steam app rules
+- **Game install** — finds your Windrose version across all Steam library folders
+- **File salvage** — copies `Config/`, `SaveProfiles/`, `ServerDescription.json`, and recent logs
+- **Crash log scan** — surfaces recent Application errors tagged Windrose/Steam/R5
 
-**Seaworthy check ⚓**
-- Compares yer ship against Windrose's minimum and recommended specs
-- **OS** — 64-bit check, Win10 (min) / Win11 (recommended)
-- **CPU** — cores and clock speed vs i7-8700K (min) / i7-10700 (rec)
-- **RAM** — 16 GB (min) / 32 GB (rec)
-- **GPU** — tiered lookup table covering NVIDIA/AMD cards from GTX 900-series through RTX 50-series and RX 9000, with a "manual review" fallback for unknown cards
-- **DirectX** — queries `dxdiag` for the version (needs DX12)
-- **Storage** — checks free space on the Windrose install drive (or C: if not installed), 30 GB required
-- **SSD detection** — warns if yer game drive is an HDD (Windrose strongly recommends SSD)
+### Can't Reach Server
 
-**Soundings (network)**
-- Adapters, link speed, IP config, route table
-- Home waters (local network profile: Public vs Private)
-- **Flag on the mast** — public IP via three fallback endpoints
-- Beacons to Steam, Cloudflare, and Google to confirm the sea lanes are open
-- Hosts file contents
+Everything in Connection Trouble, plus:
 
-**Hold inventory (Windrose / Steam)**
-- Auto-finds Windrose installs across every Steam library folder (parses `libraryfolders.vdf`)
-- Hull markings — executable versions for `Windrose*.exe` / `R5*.exe`
-- Salvages `Config/`, `SaveProfiles/`, `ServerDescription.json`, and up to 50 log files
-- Watch posts — Steam/Windrose firewall application filters
-- Crew roster — running Steam/Windrose processes
-- Man overboard — recent Application log errors tagged Windrose/Steam/crash
-- Powder magazine — installed Visual C++ runtimes
+- **DNS resolution** of the target hostname
+- **Ping** — ICMP with average latency
+- **TCP port test** — detailed result on your target IP and port
+- **Traceroute** — full path to the target
 
-**Spyglass (optional remote soundings)**
-- DNS resolution (if target is a hostname)
-- Cannon shot — ICMP ping with average latency
-- Boarding party — TCP port test on your specified port
-- **Sounding the harbor** — auto-probes common ports 7777, 7778, 27015, 27036
-- Ship's log — trace route (skippable)
-- A straight note on UDP: PowerShell can't positively confirm UDP is open from the client side
+### Shipwright (dedicated server setup)
+
+- **ServerDescription.json** — parses and validates InviteCode length, P2pProxyAddress, region field
+- **WorldDescription.json** — checks presence and structure
+- **SaveProfiles inventory** — lists profiles with RocksDB path check
+- **Port listen test** — confirms the server process is actually listening on 7777, 27015, 27036
+- **Firewall rules** — Windrose/Steam application filters
+- **Crash logs** — recent server-side errors
+- **Full file salvage**
 
 ---
 
@@ -67,13 +52,13 @@ Inside you'll find:
 |------|---------|
 | `CaptainsLog.txt` | Full human-readable report |
 | `CaptainsLog.md` | Markdown findings table — paste straight into Discord |
-| `CaptainsLog_REDACTED.txt` | **Safe-to-share** copy with hostname/username/IPs/MACs scrubbed |
+| `CaptainsLog_REDACTED.txt` | Safe-to-share copy with hostname/username/IPs/MACs scrubbed |
 | `CaptainsLog_REDACTED.md` | Safe-to-share markdown version |
 | `Manifest.csv` | PASS/WARN/FAIL/INFO findings, one per row |
 | `Salvage/` | Recovered game configs and logs |
-| `...zip` | The whole chest sealed for transport, next to the folder |
+| `...zip` | The whole chest sealed for transport |
 
-At the end of every run, you'll be asked whether to create the redacted copies. Post those (not the full log) when asking for help in public channels — they keep all the diagnostic data a helper needs while hiding your hostname, public IP, MAC addresses, and file paths behind `<REDACTED_*>` placeholders.
+At the end of every run you'll be asked whether to create the redacted copies. Post those (not the full log) when asking for help in public channels.
 
 ---
 
@@ -83,58 +68,32 @@ At the end of every run, you'll be asked whether to create the redacted copies. 
 
 Double-click `CaptainsChest.exe`.
 
-On first run you'll see a few Windows prompts. **This is normal for unsigned community tools** — work through them and it'll stick for future runs:
+On first run you'll see a few Windows prompts. This is normal for unsigned community tools:
 
-1. **Windows Defender SmartScreen** — "Windows protected your PC"
-   Click **More info** → **Run anyway**
-2. **User Account Control (UAC)** — "Do you want to allow this app to make changes?"
-   Click **Yes** (admin is needed for full firewall and event log access)
-3. The pirate banner appears — chart yer course and follow the prompts
+1. **Windows Defender SmartScreen** — click **More info** then **Run anyway**
+2. **User Account Control (UAC)** — click **Yes** (admin is needed for firewall and event log access)
+3. The pirate banner appears — pick your mode and follow the prompts
 
-### ⚠️ Why does SmartScreen / my antivirus complain?
+### Why does SmartScreen or my antivirus complain?
 
-The exe is a PowerShell script compiled with a tool called `ps2exe`. Because some malware authors use the same tool, **Windows Defender and other AV products sometimes flag `ps2exe` output as a false positive**. Typical warnings:
-
-- SmartScreen: "Windows protected your PC" (one-click past it)
-- Defender: "Trojan:Win32/Wacatac" (false positive)
-- Some AVs may silently quarantine or delete the file
-
-**If you don't want to trust the exe, don't!** The source `CaptainsChest.ps1` is in the same zip. Open it in Notepad, read every line, and if it looks clean, run the `.ps1` directly:
+The exe is a PowerShell script compiled with `ps2exe`. Some AV products flag `ps2exe` output as a false positive. If you don't want to trust the exe, don't. The source `CaptainsChest.ps1` is in the same zip. Open it in Notepad, read every line, and run it directly:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\CaptainsChest.ps1
 ```
 
-The source being right there is the point — this is a community tool, not a black box.
-
-### Alternative: run the .ps1 directly
-
-If you'd rather skip the exe entirely:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\CaptainsChest.ps1
-```
-
-Or unblock the file once and right-click → Run with PowerShell will work forever after:
+Or unblock it once and right-click, Run with PowerShell will work from then on:
 
 ```powershell
 Unblock-File .\CaptainsChest.ps1
 ```
 
-### Picking a mode
-
-You'll be prompted to chart a course:
-
-1. **Full voyage** — ship, shore, and sound out a distant port
-2. **Quick sweep** — ship info and a quick port test
-3. **Stay ashore** — ship and shore only, no remote soundings
-
 ### Non-interactive (scripted)
 
 ```powershell
-.\CaptainsChest.exe -Mode Full -ServerIP 1.2.3.4 -ServerPort 7777 -NoPause
-.\CaptainsChest.exe -Mode LocalOnly -NoPause
-.\CaptainsChest.exe -Mode Full -ServerIP crew.example.com -SkipTraceRoute -NoPause
+.\CaptainsChest.exe -Mode ConnectionTrouble -NoPause
+.\CaptainsChest.exe -Mode CantReachServer -ServerIP 1.2.3.4 -ServerPort 7777 -NoPause
+.\CaptainsChest.exe -Mode Shipwright -NoPause
 ```
 
 ### Parameters
@@ -144,73 +103,51 @@ You'll be prompted to chart a course:
 | `-OutputPath` | Where to drop the chest | `$env:USERPROFILE\Desktop\WindroseCaptainChest` |
 | `-ServerIP` | Server IP or hostname to sound | prompted |
 | `-ServerPort` | Port to test | `7777` |
-| `-Mode` | `Full`, `Quick`, `LocalOnly` | prompted |
+| `-Mode` | `ConnectionTrouble`, `CantReachServer`, `Shipwright` | prompted |
 | `-SkipTraceRoute` | Skip tracert (saves ~30s) | off |
-| `-SkipNetworkTests` | Skip all remote tests and public IP lookup | off |
 | `-NoPause` | Don't wait for Enter at the end | off |
 | `-Redact` | Auto-create redacted copy without prompting | off |
 | `-NoRedactPrompt` | Skip the redacted-copy prompt entirely | off |
 
 ---
 
-## 👮 Admin rights
-
-- **Running the `.exe`**: automatically prompts for admin via UAC. Click Yes.
-- **Running the `.ps1` directly**: not required, but recommended. Without admin you'll miss some firewall rule details and a chunk of event log entries. The report tells you its admin state up top so the dockmaster knows what's in the manifest.
-
----
-
-## 🕵️ A word on privacy
-
-The report contains:
-
-- Your computer name and username
-- Your local and public IP addresses
-- Hardware identifiers (MAC addresses, GPU names)
-- File paths on your machine
-- Hosts file contents
-
-Give `CaptainsLog.txt` a once-over before posting it in a public channel. If you need to scrub anything, the markdown summary (`CaptainsLog.md`) is usually enough for most troubleshooting without handing over the full log.
-
----
-
-## 🎯 Port presets
-
-Tested by default whenever you supply a target. Edit the `$script:WindrosePortPresets` block at the top of the script if yer charts differ.
-
-| Port | Protocol | Purpose |
-|---|---|---|
-| 7777 | UDP/TCP | Default game port and Direct IP host mode |
-| 7778 | UDP | Secondary game port |
-| 27015 | UDP/TCP | Steam query / master |
-| 27036 | UDP/TCP | Steam streaming / P2P |
-
----
-
 ## 🆘 Direct IP fallback
 
-If Fleet check shows Connection Services are unreachable, Windrose can still be hosted through **Direct IP** mode instead of the backend service path. The report now prints this as a fallback when the backend is fully unreachable or when partial reachability points to 3478 / ISP-side Connection Services trouble.
-
-Use this path in game:
+If Fleet check shows Connection Services are unreachable, Windrose can still be hosted through Direct IP mode. The report prints this as a fallback when the backend is unreachable or when partial reachability points to ISP-side trouble on port 3478.
 
 ```
 Host a Game -> Direct IP tab -> port 7777
 ```
 
-Then share your public IP with your crew. This bypasses Windrose Connection Services entirely, but it still requires **port 7777** to be open on your router.
+Share your public IP with your crew. This bypasses Windrose Connection Services entirely but still requires port 7777 to be open on your router.
 
-## 📋 Windrose system requirements (what Seaworthy checks against)
+---
 
-| Spec | Minimum | Recommended |
+## 🎯 Port presets
+
+| Port | Protocol | Purpose |
 |---|---|---|
-| OS | Windows 10 (64-bit) | Windows 11 (64-bit) |
-| CPU | Intel i7-8700K / AMD Ryzen 7 2700X | Intel i7-10700 / AMD Ryzen 7 5800X |
-| RAM | 16 GB | 32 GB |
-| GPU | NVIDIA GTX 1080 Ti / AMD RX 6800 | NVIDIA RTX 3080 / AMD RX 6800 XT |
-| DirectX | 12 | 12 |
-| Storage | 30 GB (SSD recommended) | 30 GB (SSD required) |
+| 7777 | UDP/TCP | Default game port and Direct IP host mode |
+| 27015 | UDP/TCP | Steam query / master |
+| 27036 | UDP/TCP | Steam streaming / P2P |
 
-The developers note that Windrose is in Early Access and these numbers are **not final**. Self-hosted servers need additional RAM on top. If the game updates its specs, edit `$script:WindroseSpecs` at the top of the script.
+---
+
+## 📖 Manual reference
+
+Prefer to run checks yourself without the script? See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — 22 sections covering every check the script runs, each with a plain English explanation, exact paste-ready PowerShell command, and guidance on reading the output. Includes the full ISP culprit table.
+
+---
+
+## 👮 Admin rights
+
+Running the exe prompts for admin via UAC automatically. Without admin you'll miss some firewall rule details and event log entries. The report states its admin state at the top so helpers know what's in the manifest.
+
+---
+
+## 🕵️ A word on privacy
+
+The report contains your computer name, username, local and public IP addresses, and file paths. Use the redacted copy when posting in public channels. It keeps all the diagnostic data a helper needs while scrubbing identifying info behind `<REDACTED_*>` placeholders.
 
 ---
 
@@ -226,7 +163,7 @@ No external modules. No installs. Single file.
 
 ## 🤝 Contributing
 
-Issues and pull requests welcome. If the port presets drift or the Windrose directory layout changes, the relevant blocks are clearly marked at the top of the script.
+Issues and pull requests welcome. If the ISP culprit table needs updating or the Windrose endpoint list changes, the relevant blocks are clearly marked at the top of the script.
 
 ---
 
