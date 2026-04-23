@@ -5,6 +5,26 @@ All notable changes to Windrose Captain's Chest will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-04-22
+
+Networking-focused rebuild. Hardware diagnostics removed entirely.
+
+### Changed
+
+- **Script rebuilt from scratch** with networking and game install as the only focus. All hardware checks removed: no GPU/CPU/RAM info, no dxdiag, no VCRuntime check, no route table, no Seaworthy spec comparison. The tool is now faster and focused on the issues that actually affect Windrose connectivity.
+- **Three modes redesigned:** ConnectionTrouble (ISP detection, fleet endpoints, firewall, game install, crash logs), CantReachServer (everything in ConnectionTrouble plus DNS resolution, ping, and traceroute to a target IP), and Shipwright (dedicated server setup, ServerDescription.json validation, SaveProfiles, port listen checks on 7777/27015/27036).
+
+### Added
+
+- **TROUBLESHOOTING.md** — 22-section manual reference mirroring every check the script runs. Each section has a plain English explanation, exact paste-ready PowerShell command, and guidance on reading the output. Ends with the full ISP culprit table. For users who want to run checks individually without the script.
+
+### Removed
+
+- GPU, CPU, RAM, and driver info
+- Seaworthy hardware spec comparison
+- dxdiag collection
+- VCRuntime enumeration
+- Route table capture
 ## [1.3.1] - 2026-04-19
 
 Direct IP fallback note added to Fleet check summary.
