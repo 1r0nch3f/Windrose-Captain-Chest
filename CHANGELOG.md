@@ -7,20 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.4.0] - 2026-04-24
 
-Save hold inspection: RocksDB health check for migrated saves.
+Live network profile, crew invite generator, and new standalone CaptainsSignal tool.
 
 ### Added
 
-- **Save hold inspection** section in the Salvage output. When `SaveProfiles` is found, the tool now walks each save slot and inspects its RocksDB structure, producing PASS/WARN/FAIL findings for every slot.
-- **Stale LOCK file detection.** RocksDB writes a `LOCK` file when a database is opened and removes it on clean shutdown. Saves migrated from Nitrado (or any external host) almost always carry a stale LOCK because the source server never shut down cleanly in the target environment. Wine and Docker-hosted servers see this and crash immediately on startup. The check reports the file path and age, and tells the operator to delete it before starting.
-- **MANIFEST and CURRENT pointer validation.** RocksDB needs a `MANIFEST-######` file and a `CURRENT` file pointing at it. Missing or empty CURRENT, or a CURRENT that points at a manifest file that doesn't exist, is flagged as FAIL with an explanation (corrupt save or version mismatch from running a newer/older server binary).
-- **SST data file inventory.** `.sst` files are RocksDB's actual data tables. Zero SST files on a slot that has a MANIFEST means the Nitrado export was incomplete (the zip didn't include the data files). Reports count and total MB.
-- **WAL file note.** Write-ahead log (`.log`) files hold uncommitted transactions from an unclean shutdown. Not a hard failure, but surfaced as INFO so helpers know RocksDB will do a replay on next open.
-- **Migration summary note** at the end of the section explaining why fresh worlds work when migrated saves don't (no stale LOCK from a different environment).
+- **Crow's nest - live network profile section** in CaptainsChest. When Windrose is running during a chest run, the report now snapshots the live TCP and UDP connections owned by `Windrose-Win64-Shipping` and analyses them against a known-good baseline:
+  - Backend connectivity check: detects which of the three connection service regions (EU/NA, SEA, CIS) Windrose contacted and in what state
+  - UDP pool check: counts external UDP sockets open for P2P peer connections, with dynamic port range detection (the range shifts each session so hard-coded ranges are not used)
+  - Hosting mode detection: identifies Direct IP mode (port 7777) vs invite code mode
+  - Firewall rule check: catches the case where the user hit Cancel on the Windows Security prompt during Direct IP hosting, which silently breaks hosting
+- **Send to crew - ready-to-copy invite message generator.** After the network profile, the report generates formatted invite messages the host can copy directly into text, iMessage, WhatsApp, or Discord. Covers all four scenarios: invite code with/without password, Direct IP with/without password.
+- **Automatic invite code detection.** The invite code is read directly from `ServerDescription.json` at `<SteamLibrary>\steamapps\common\Windrose\R5\ServerDescription.json`. No need to copy it from the in-game screen. Server name, max players, region, and password also read from the same file.
+- **Public IP warning** included in Direct IP invite messages.
+- **Server password redaction** in redacted report versions. Password replaced with `<REDACTED_SERVER_PASSWORD>`.
+- **CaptainsSignal.ps1** - new standalone lightweight tool. Runs in seconds with no hardware collection. Reads server config, checks the live network, and prints a ready-to-copy crew invite message in colour directly to the terminal.
 
-### Why
+### Fixed
 
-A community report surfaced a pattern: Nitrado-to-self-hosted Docker migrations consistently crash on startup when using the Nitrado save files, but a fresh world works. The root cause is almost always the stale LOCK file. This check gives Discord helpers immediate visibility into save structure without needing the operator to know what RocksDB is.
+- **Process name detection.** The actual shipping binary is `Windrose-Win64-Shipping`, not `Windrose`. All network profile checks now use the correct name.
+- **UDP pool port range.** Detection now finds any sequential block of 10+ external UDP sockets owned by the process rather than checking a hard-coded range.
 
 ## [1.3.1] - 2026-04-19
 

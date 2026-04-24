@@ -15,11 +15,13 @@
       - Soundings:      Network adapters, local IP, public IP
       - Hold inventory: Windrose install detection and executable versions
       - Watch posts:    Firewall profile and Steam/Windrose rules
+      - Crow's nest:    Live network profile snapshot (TCP/UDP connections, backend
+                        reachability, UDP P2P pool, Direct IP vs invite code mode,
+                        firewall rule check) - requires Windrose to be running
       - Crew roster:    Steam and Windrose process state
       - Log book:       Recent application and system errors
       - Spyglass:       Optional server reachability (DNS, ping, TCP, trace)
       - Salvage:        Collected Config/SaveProfiles/ServerDescription/logs
-      - Save hold:     RocksDB save health check (LOCK file, MANIFEST, SST/WAL inventory)
 
     Outputs to a timestamped chest on yer Desktop:
       - CaptainsLog.txt           - full human-readable report
@@ -27,7 +29,7 @@
       - CaptainsLog_REDACTED.txt  - optional scrubbed copy safe to post publicly
       - CaptainsLog_REDACTED.md   - optional scrubbed markdown version
       - Manifest.csv              - pass/warn/fail findings
-      - Salvage/                  - collected game files (SaveProfiles, Config, logs)
+      - Salvage/                  - collected game files
       - Chest_<timestamp>.zip     - the whole chest, sealed for transport
 
 .PARAMETER OutputPath
@@ -1625,115 +1627,6 @@ function Copy-IfExists {
     return $false
 }
 
-function Check-SaveHealth {
-    # Inspects a RocksDB-backed SaveProfiles directory for structural issues.
-    # Called from Collect-GameFiles for each detected save slot.
-    # Surfaces findings that help diagnose Nitrado-to-self-hosted migration crashes.
-    param([string]$SaveProfilesPath)
-
-    if (-not (Test-Path $SaveProfilesPath)) { return }
-
-    Write-Section 'Save hold inspection (RocksDB health)'
-
-    $slots = Get-ChildItem -Path $SaveProfilesPath -Directory -ErrorAction SilentlyContinue
-    if (-not $slots -or $slots.Count -eq 0) {
-        Write-Line 'No save slots found under SaveProfiles.'
-        Add-Finding -Status 'INFO' -Check 'Save Health' -Details 'SaveProfiles directory exists but contains no save slots.'
-        return
-    }
-
-    Write-Line ("Found {0} save slot(s):" -f $slots.Count)
-
-    foreach ($slot in $slots) {
-        $slotName = $slot.Name
-        Write-Line ''
-        Write-Line "  Slot: $slotName"
-
-        # --- LOCK file check ---
-        # RocksDB writes a LOCK file on open and removes it on clean shutdown.
-        # Migrated saves from Nitrado (or any external host) almost always carry
-        # a stale LOCK because the source server never did a clean shutdown cycle
-        # in the target environment. Wine/Docker sees this as the DB already being
-        # open and crashes immediately on startup.
-        $lockFile = Join-Path $slot.FullName 'LOCK'
-        if (Test-Path $lockFile) {
-            $lockInfo = Get-Item $lockFile -ErrorAction SilentlyContinue
-            $lockAge  = if ($lockInfo) { [math]::Round(((Get-Date) - $lockInfo.LastWriteTime).TotalHours, 1) } else { '?' }
-            Write-Line "    [WARN] Stale LOCK file detected (last written ~$lockAge hours ago)."
-            Write-Line '           This will cause crash-on-startup when migrating saves to a new host.'
-            Write-Line '           Fix: delete the LOCK file before starting the server.'
-            Write-Line "           Path: $lockFile"
-            Add-Finding -Status 'WARN' -Check "Save Health: $slotName" -Details "Stale RocksDB LOCK file in slot '$slotName'. Delete before migrating to self-hosted/Docker. Path: $lockFile"
-        } else {
-            Write-Line '    [PASS] No LOCK file (clean shutdown or already removed).'
-            Add-Finding -Status 'PASS' -Check "Save Health: $slotName" -Details "No stale LOCK file in slot '$slotName'."
-        }
-
-        # --- MANIFEST / CURRENT file check ---
-        # RocksDB requires a MANIFEST-###### file and a CURRENT pointer to be
-        # present and consistent. A missing or zero-byte CURRENT means the DB
-        # cannot find its own manifest and will refuse to open.
-        $currentFile   = Join-Path $slot.FullName 'CURRENT'
-        $manifestFiles = Get-ChildItem -Path $slot.FullName -Filter 'MANIFEST-*' -ErrorAction SilentlyContinue
-
-        if (-not (Test-Path $currentFile)) {
-            Write-Line '    [FAIL] CURRENT pointer file missing - save is unreadable.'
-            Add-Finding -Status 'FAIL' -Check "Save Health: $slotName" -Details "RocksDB CURRENT file missing in slot '$slotName'. Save data is likely corrupt or incomplete."
-        } else {
-            $currentContent = (Get-Content $currentFile -ErrorAction SilentlyContinue | Select-Object -First 1)
-            if ([string]::IsNullOrWhiteSpace($currentContent)) {
-                Write-Line '    [FAIL] CURRENT file is empty - save is unreadable.'
-                Add-Finding -Status 'FAIL' -Check "Save Health: $slotName" -Details "RocksDB CURRENT file is empty in slot '$slotName'. Save is corrupt."
-            } elseif ($manifestFiles -and ($manifestFiles.Name -notcontains $currentContent.Trim())) {
-                Write-Line "    [WARN] CURRENT points to '$($currentContent.Trim())' but that file was not found."
-                Write-Line '           Save may be corrupt or from a different server version.'
-                Add-Finding -Status 'WARN' -Check "Save Health: $slotName" -Details "CURRENT points to '$($currentContent.Trim())' but manifest file not found in slot '$slotName'. Possible corruption or version mismatch."
-            } else {
-                Write-Line "    [PASS] CURRENT pointer looks valid ($($currentContent.Trim()))."
-                Add-Finding -Status 'PASS' -Check "Save Health: $slotName" -Details "CURRENT pointer valid in slot '$slotName'."
-            }
-        }
-
-        if (-not $manifestFiles) {
-            Write-Line '    [FAIL] No MANIFEST file found - save is unreadable.'
-            Add-Finding -Status 'FAIL' -Check "Save Health: $slotName" -Details "No RocksDB MANIFEST file in slot '$slotName'. Save is corrupt or was never fully written."
-        } else {
-            Write-Line ("    [PASS] MANIFEST file present: {0}" -f ($manifestFiles | Select-Object -First 1).Name)
-        }
-
-        # --- SST file inventory ---
-        # SST files (.sst) are the actual data tables. A healthy save has at least
-        # one. Zero SST files on a slot that has a MANIFEST usually means a partial
-        # transfer (Nitrado zip didn't include the data files).
-        $sstFiles = Get-ChildItem -Path $slot.FullName -Filter '*.sst' -ErrorAction SilentlyContinue
-        if (-not $sstFiles -or $sstFiles.Count -eq 0) {
-            Write-Line '    [WARN] No .sst data files found - save may be empty or transfer was incomplete.'
-            Add-Finding -Status 'WARN' -Check "Save Health: $slotName" -Details "No .sst data files in slot '$slotName'. Save may be empty or the Nitrado export was incomplete (missing data files)."
-        } else {
-            $sstTotalMB = [math]::Round(($sstFiles | Measure-Object -Property Length -Sum).Sum / 1MB, 2)
-            Write-Line ("    [PASS] {0} .sst file(s), {1} MB total data." -f $sstFiles.Count, $sstTotalMB)
-            Add-Finding -Status 'PASS' -Check "Save Health: $slotName" -Details "$($sstFiles.Count) .sst files, $sstTotalMB MB in slot '$slotName'."
-        }
-
-        # --- WAL file note ---
-        # Write-ahead log (.log) files hold uncommitted transactions. If a server
-        # crashed mid-write the WAL may contain partial data. Not a hard failure
-        # but worth surfacing so helpers know replay will happen on next open.
-        $walFiles = Get-ChildItem -Path $slot.FullName -Filter '*.log' -ErrorAction SilentlyContinue
-        if ($walFiles -and $walFiles.Count -gt 0) {
-            $walTotalKB = [math]::Round(($walFiles | Measure-Object -Property Length -Sum).Sum / 1KB, 1)
-            Write-Line ("    [INFO] {0} WAL file(s) present ({1} KB). RocksDB will replay these on next open." -f $walFiles.Count, $walTotalKB)
-            Add-Finding -Status 'INFO' -Check "Save Health: $slotName" -Details "$($walFiles.Count) WAL (.log) file(s) in slot '$slotName' ($walTotalKB KB). Normal after unclean shutdown; RocksDB replays on next open."
-        }
-    }
-
-    Write-Line ''
-    Write-Line 'Save hold inspection complete.'
-    Write-Line 'If migrating from Nitrado to self-hosted/Docker: the most common crash cause'
-    Write-Line 'is a stale LOCK file in the save slot. Delete it before starting the server.'
-    Write-Line 'Fresh worlds work because they never carry a LOCK from a different environment.'
-}
-
 function Get-GameVersionInfo {
     $installs = @(Find-WindroseInstall)
     Write-Section 'Shipyard (Windrose installs)'
@@ -1786,8 +1679,6 @@ function Collect-GameFiles {
             Write-Line 'SaveProfiles not found'
         }
 
-        Check-SaveHealth -SaveProfilesPath $saveProfiles
-
         if (Copy-IfExists -Source $configPath -Destination (Join-Path $destBase 'Config')) {
             Write-Line 'Recovered Config'
         } else {
@@ -1836,6 +1727,271 @@ function Check-LocalFirewallRules {
     } else {
         Write-Line 'No matching Steam/Windrose application filters were found.'
         Add-Finding -Status 'WARN' -Check 'Firewall app rules' -Details 'No Steam/Windrose firewall filters found.'
+    }
+}
+
+function Check-WindroseNetworkProfile {
+    <#
+        Snapshots the live network connections owned by Windrose-Win64-Shipping
+        and compares them against the known-good baseline established from
+        direct observation on a healthy machine.
+
+        Baseline (observed 2025-04):
+          - Process name: Windrose-Win64-Shipping (NOT Windrose.exe)
+          - Backend IPs: 3 x port 443 connections (EU/NA, SEA, CIS regions)
+            These are CloseWait at idle/in-session, Established on host screen.
+          - UDP pool: 12 sockets on ports 57095-57106 (0.0.0.0) for P2P peers
+          - Loopback: internal client/server IPC sockets
+          - Direct IP mode adds: port 7777 loopback + 1 extra UDP socket (~60250)
+
+        Findings:
+          PASS  - game running, backend reachable, UDP pool present
+          WARN  - game running but backend missing or UDP pool smaller than expected
+          INFO  - game not running (cannot snapshot)
+          FAIL  - game running but no backend contacts and no UDP pool at all
+    #>
+
+    Write-Section 'Crow''s nest (live network profile)'
+
+    # Known Windrose backend IPs per region (observed, may rotate within AWS pools)
+    $script:WindroseBackendRegions = @{
+        'EU & NA' = @('3.66.107.109', '3.75.35.235', '3.36.19.254')
+        'SEA'     = @('3.37.92.160',  '3.36.19.254')
+        'CIS'     = @('149.154.64.47')
+    }
+    $allKnownBackendIPs = $script:WindroseBackendRegions.Values | ForEach-Object { $_ } | Sort-Object -Unique
+
+    $wr = Get-Process | Where-Object { $_.Name -match 'Windrose-Win64' } | Select-Object -First 1
+
+    if (-not $wr) {
+        Write-Line 'Windrose is not currently running - network profile skipped.'
+        Write-Line 'For best results, run Captain''s Chest while Windrose is open.'
+        Add-Finding -Status 'INFO' -Check 'Network profile' -Details 'Windrose not running - live network snapshot skipped.'
+        return
+    }
+
+    Write-Line ("Process: {0}  PID: {1}" -f $wr.Name, $wr.Id)
+    Write-Line ''
+
+    # TCP snapshot
+    $tcpConns = Get-NetTCPConnection | Where-Object { $_.OwningProcess -eq $wr.Id }
+    $udpConns = Get-NetUDPEndpoint   | Where-Object { $_.OwningProcess -eq $wr.Id }
+
+    # Print raw TCP
+    Write-Line '--- TCP connections ---'
+    if ($tcpConns) {
+        $tcpConns | Sort-Object State, RemoteAddress |
+            Select-Object LocalPort, RemoteAddress, RemotePort, State |
+            Format-Table -AutoSize | Out-String | ForEach-Object { Write-Line $_.TrimEnd() }
+    } else {
+        Write-Line '[none]'
+    }
+
+    # Print raw UDP
+    Write-Line '--- UDP endpoints ---'
+    if ($udpConns) {
+        $udpConns | Sort-Object LocalPort |
+            Select-Object LocalAddress, LocalPort |
+            Format-Table -AutoSize | Out-String | ForEach-Object { Write-Line $_.TrimEnd() }
+    } else {
+        Write-Line '[none]'
+    }
+
+    Write-Line ''
+    Write-Line '--- Analysis ---'
+
+    # Check 1: Backend connectivity
+    $backendContacts = $tcpConns | Where-Object {
+        $_.RemoteAddress -in $allKnownBackendIPs -and $_.RemotePort -eq 443
+    }
+
+    if ($backendContacts) {
+        $regionHits = foreach ($conn in $backendContacts) {
+            foreach ($region in $script:WindroseBackendRegions.Keys) {
+                if ($conn.RemoteAddress -in $script:WindroseBackendRegions[$region]) {
+                    $region; break
+                }
+            }
+        }
+        $regionHits = $regionHits | Sort-Object -Unique
+        $stateNote  = ($backendContacts | Select-Object -ExpandProperty State | Sort-Object -Unique) -join ', '
+        Write-Line ("Backend: contacted {0} region(s) - {1} ({2})" -f $regionHits.Count, ($regionHits -join ', '), $stateNote)
+        Add-Finding -Status 'PASS' -Check 'Network: backend' -Details ("Windrose contacted {0} connection service region(s): {1}" -f $regionHits.Count, ($regionHits -join ', '))
+    } else {
+        Write-Line 'Backend: no known Windrose connection service IPs detected in TCP connections.'
+        Write-Line '  This may mean:'
+        Write-Line '  - The game is at the main menu and has not yet attempted hosting'
+        Write-Line '  - The connection services are being blocked (ISP or firewall)'
+        Write-Line '  - The backend IPs have rotated (check Fleet check section for probed results)'
+        Add-Finding -Status 'WARN' -Check 'Network: backend' -Details 'No Windrose connection service IPs seen in live TCP snapshot. May indicate blocking or game not yet in hosting state.'
+    }
+
+    # Check 2: UDP pool (P2P readiness)
+    # Windrose opens a sequential block of 12 UDP sockets for P2P peer connections.
+    # The port range shifts each session so we detect any block of 10+ sockets
+    # on 0.0.0.0 owned by the process rather than a hard-coded range.
+    $udpExternal = $udpConns | Where-Object { $_.LocalAddress -eq '0.0.0.0' } |
+        Sort-Object LocalPort
+    $udpPoolCount = ($udpExternal | Measure-Object).Count
+    $udpPortRange = if ($udpPoolCount -gt 0) {
+        "$($udpExternal[0].LocalPort)-$($udpExternal[-1].LocalPort)"
+    } else { 'none' }
+
+    if ($udpPoolCount -ge 10) {
+        Write-Line ("UDP pool: {0} sockets open on ports {1} - healthy" -f $udpPoolCount, $udpPortRange)
+        Add-Finding -Status 'PASS' -Check 'Network: UDP pool' -Details ("$udpPoolCount UDP sockets open ($udpPortRange) - peer connections ready.")
+    } elseif ($udpPoolCount -gt 0) {
+        Write-Line ("UDP pool: only {0} sockets open ({1}) - partial pool" -f $udpPoolCount, $udpPortRange)
+        Write-Line '  Expected at least 10 sequential UDP sockets. Fewer may indicate firewall or ISP blocking UDP.'
+        Add-Finding -Status 'WARN' -Check 'Network: UDP pool' -Details ("Only $udpPoolCount P2P UDP sockets open ($udpPortRange). Possible firewall or ISP UDP blocking.")
+    } else {
+        Write-Line 'UDP pool: no external UDP sockets detected.'
+        Write-Line '  Windrose may not be in a hosting state, or UDP traffic is being blocked entirely.'
+        Add-Finding -Status 'WARN' -Check 'Network: UDP pool' -Details 'No P2P UDP sockets detected. Game may not be hosting, or UDP blocked.'
+    }
+
+    # Check 3: Direct IP mode detection
+    $port7777 = $tcpConns | Where-Object {
+        $_.RemotePort -eq 7777 -or $_.LocalPort -eq 7777
+    }
+    if ($port7777) {
+        Write-Line 'Direct IP mode: port 7777 detected - game is hosting in Direct IP mode.'
+        Write-Line '  Reminder: players need your PUBLIC IP to connect. See Soundings section above.'
+        Add-Finding -Status 'INFO' -Check 'Network: hosting mode' -Details 'Direct IP mode active (port 7777 in use). Ensure port 7777 is open on your router.'
+    } else {
+        Write-Line 'Direct IP mode: port 7777 not detected - game is using invite code / connection services mode.'
+        Add-Finding -Status 'INFO' -Check 'Network: hosting mode' -Details 'Invite code mode (no port 7777 detected). Relies on connection services for peer matching.'
+    }
+
+    # Check 4: Firewall rule for Kraken Express / Windrose
+    $krakenRule = Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue |
+        Where-Object { $_.Program -match 'Windrose|Kraken' }
+    if ($krakenRule) {
+        Write-Line 'Firewall rule: Windrose/Kraken Express application rule found - OK.'
+        Add-Finding -Status 'PASS' -Check 'Network: firewall rule' -Details 'Windrose firewall application rule present.'
+    } else {
+        Write-Line 'Firewall rule: no Windrose or Kraken Express firewall rule found.'
+        Write-Line '  If Windows prompted "Allow Windrose on public/private networks?" and you hit Cancel,'
+        Write-Line '  Direct IP hosting will fail. Fix: Windows Defender Firewall > Allow an app > add Windrose.'
+        Add-Finding -Status 'WARN' -Check 'Network: firewall rule' -Details 'No Windrose firewall application rule. May have cancelled the Windows Security prompt during Direct IP host.'
+    }
+
+    # Check 5: Crew invite message
+    # ServerDescription.json lives at <SteamLib>\steamapps\common\Windrose\R5\ServerDescription.json
+    # Confirmed structure: .ServerDescription_Persistent.InviteCode
+    $inviteCode     = $null
+    $serverDescJson = $null
+
+    $serverDescCandidates = @(
+        "$env:ProgramFiles(x86)\Steam\steamapps\common\Windrose\R5\ServerDescription.json",
+        "$env:ProgramFiles\Steam\steamapps\common\Windrose\R5\ServerDescription.json"
+    )
+    $steamLibs = Get-SteamLibraries
+    foreach ($lib in $steamLibs) {
+        $serverDescCandidates += (Join-Path $lib 'steamapps\common\Windrose\R5\ServerDescription.json')
+    }
+
+    foreach ($candidate in ($serverDescCandidates | Select-Object -Unique)) {
+        if (Test-Path $candidate) {
+            try {
+                $serverDescJson = Get-Content $candidate -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                $inviteCode = $serverDescJson.ServerDescription_Persistent.InviteCode
+                if ($inviteCode) { break }
+            } catch { }
+        }
+    }
+
+    Write-Section 'Send to crew (ready-to-copy invite)'
+
+    $isDirectIP    = $null -ne $port7777
+    $hasPublicIP   = -not [string]::IsNullOrWhiteSpace($script:PublicIP)
+    $hasInviteCode = -not [string]::IsNullOrWhiteSpace($inviteCode)
+
+    # Pull extra server details from the JSON for the invite message
+    $serverName    = if ($serverDescJson) { $serverDescJson.ServerDescription_Persistent.ServerName } else { 'Windrose Server' }
+    $maxPlayers    = if ($serverDescJson) { $serverDescJson.ServerDescription_Persistent.MaxPlayerCount } else { $null }
+    $isPassword    = if ($serverDescJson) { $serverDescJson.ServerDescription_Persistent.IsPasswordProtected } else { $false }
+    $serverPass    = if ($serverDescJson) { $serverDescJson.ServerDescription_Persistent.Password } else { '' }
+    $passwordLine  = if ($isPassword -and -not [string]::IsNullOrWhiteSpace($serverPass)) { "Password: $serverPass" } else { $null }
+    $serverInfo    = if ($maxPlayers) { "$serverName (max $maxPlayers players)" } else { $serverName }
+
+    if ($isDirectIP -and $hasPublicIP) {
+        # Direct IP mode - use public IP
+        Write-Line 'Mode: Direct IP hosting'
+        Write-Line ''
+        Write-Line '*** PUBLIC IP WARNING ***'
+        Write-Line "Your public IP ($($script:PublicIP)) identifies your home internet connection."
+        Write-Line 'Only share it with people you trust. Do not post it publicly in Discord servers,'
+        Write-Line 'forums, or social media. Change it if you move or your ISP resets your connection.'
+        Write-Line ''
+        Write-Line '--- Copy this message (text / iMessage / WhatsApp) ---'
+        Write-Line "Hey! Join my Windrose server: $serverInfo"
+        Write-Line "Direct IP: $($script:PublicIP)"
+        Write-Line "Port: 7777"
+        if ($passwordLine) { Write-Line $passwordLine }
+        Write-Line "In-game: Host a Game > Direct IP tab"
+        Write-Line "See you on deck!"
+        Write-Line ''
+        Write-Line '--- Copy this message (Discord) ---'
+        Write-Line "**Join my Windrose server - $serverInfo!**"
+        Write-Line "In-game: **Host a Game > Direct IP tab**"
+        Write-Line "``IP: $($script:PublicIP)``  ``Port: 7777``"
+        if ($passwordLine) { Write-Line ("``$passwordLine``") }
+        Write-Line "See you on deck!"
+        $passNote = if ($isPassword) { ' (password protected)' } else { '' }
+        Add-Finding -Status 'PASS' -Check 'Crew invite' -Details "Direct IP invite ready. Public IP: $($script:PublicIP) Port: 7777$passNote"
+
+    } elseif (-not $isDirectIP -and $hasInviteCode) {
+        # Invite code mode - code found on disk
+        Write-Line 'Mode: Invite code hosting'
+        Write-Line ''
+        Write-Line '--- Copy this message (text / iMessage / WhatsApp) ---'
+        Write-Line "Hey! Join my Windrose server: $serverInfo"
+        Write-Line "Invite code: $inviteCode"
+        if ($passwordLine) { Write-Line $passwordLine }
+        Write-Line "In-game: Join a Game > Enter Code"
+        Write-Line "See you on deck!"
+        Write-Line ''
+        Write-Line '--- Copy this message (Discord) ---'
+        Write-Line "**Join my Windrose server - $serverInfo!**"
+        Write-Line "Go to **Join a Game > Enter Code** and use:"
+        Write-Line "``$inviteCode``"
+        if ($passwordLine) { Write-Line ("``$passwordLine``") }
+        Write-Line "See you on deck!"
+        $passNote = if ($isPassword) { ' (password protected)' } else { '' }
+        Add-Finding -Status 'PASS' -Check 'Crew invite' -Details "Invite code invite ready. Code: $inviteCode$passNote"
+
+    } elseif (-not $isDirectIP -and -not $hasInviteCode) {
+        # Invite code mode but code not found on disk yet
+        Write-Line 'Mode: Invite code hosting (code not yet found on disk)'
+        Write-Line 'The invite code appears in-game on the Host a Game > Invite Code screen.'
+        Write-Line 'Share this template with your crew and fill in the code manually:'
+        Write-Line ''
+        Write-Line '--- Copy this message (text / iMessage / WhatsApp) ---'
+        Write-Line "Hey! Join my Windrose server"
+        Write-Line "Invite code: [copy from Host a Game screen]"
+        Write-Line "In-game: Join a Game > Enter Code"
+        Write-Line "See you on deck!"
+        Write-Line ''
+        Write-Line '--- Copy this message (Discord) ---'
+        Write-Line "**Join my Windrose server!**"
+        Write-Line "Go to **Join a Game > Enter Code** and use:"
+        Write-Line "``[copy from Host a Game screen]``"
+        Write-Line "See you on deck!"
+        Add-Finding -Status 'INFO' -Check 'Crew invite' -Details 'Invite code template generated. Code not auto-detected - copy from in-game Host screen.'
+
+    } elseif ($isDirectIP -and -not $hasPublicIP) {
+        # Direct IP mode but public IP lookup failed
+        Write-Line 'Mode: Direct IP hosting - but public IP lookup failed.'
+        Write-Line 'Could not auto-detect your public IP. Find it manually at https://whatismyip.com'
+        Write-Line 'then share with your crew:'
+        Write-Line ''
+        Write-Line '--- Copy this message (text / iMessage / WhatsApp) ---'
+        Write-Line "Hey! Join my Windrose server"
+        Write-Line "Direct IP: [your public IP from whatismyip.com]"
+        Write-Line "Port: 7777"
+        Write-Line "See you on deck!"
+        Add-Finding -Status 'WARN' -Check 'Crew invite' -Details 'Direct IP mode active but public IP lookup failed. User must find IP manually.'
     }
 }
 
@@ -1968,6 +2124,30 @@ function New-RedactedReport {
     # Full user profile path (in case env var resolves differently)
     $content = $content -replace $userHomeEscaped, 'C:\Users\<REDACTED_USER>'
     $content = $content -replace $userPathEscaped, 'C:\Users\<REDACTED_USER>'
+
+    # Server password - scrub actual password value from the report
+    $serverDescPaths = @(
+        "$env:ProgramFiles(x86)\Steam\steamapps\common\Windrose\R5\ServerDescription.json"
+        "$env:ProgramFiles\Steam\steamapps\common\Windrose\R5\ServerDescription.json"
+    )
+    try {
+        $steamLibs = Get-SteamLibraries
+        foreach ($lib in $steamLibs) {
+            $serverDescPaths += (Join-Path $lib 'steamapps\common\Windrose\R5\ServerDescription.json')
+        }
+    } catch { }
+    foreach ($sdPath in ($serverDescPaths | Select-Object -Unique)) {
+        if (Test-Path $sdPath) {
+            try {
+                $sdJson = Get-Content $sdPath -Raw | ConvertFrom-Json
+                $sdPass = $sdJson.ServerDescription_Persistent.Password
+                if (-not [string]::IsNullOrWhiteSpace($sdPass)) {
+                    $content = $content -replace [regex]::Escape($sdPass), '<REDACTED_SERVER_PASSWORD>'
+                }
+            } catch { }
+            break
+        }
+    }
 
     # --- Generic patterns -----------------------------------------------------
 
@@ -2149,6 +2329,7 @@ Check-SteamAndProcesses
 $installs = Get-GameVersionInfo
 Collect-GameFiles -Installs $installs
 Check-LocalFirewallRules
+Check-WindroseNetworkProfile
 Check-RecentErrors
 Check-VCRuntimes
 
