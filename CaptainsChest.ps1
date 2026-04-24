@@ -1,171 +1,259 @@
 <#
 .SYNOPSIS
-    Captain's Chest - diagnostic and server toolkit for Windrose crews.
+    Captain's Chest - a diagnostic toolkit for Windrose crews.
 
 .DESCRIPTION
-    Three modes of operation:
+    Gather ye logs, charts, and soundings into one tidy chest. Produces a
+    single pasteable report covering:
 
-      1. Connection trouble  - ISP detection, fleet endpoint check, firewall,
-                               game version, recent errors, hosts file.
-                               The 90% case. Runs in ~20 seconds.
+      - Ship's papers:  OS, CPU, RAM, GPU (with driver age check)
+      - Seaworthy:      Spec check vs Windrose min/recommended (CPU, RAM, GPU,
+                        DirectX, disk space, SSD detection)
+      - Fleet check:    Windrose backend service reachability (DNS, STUN/TURN,
+                        regional API gateways) - diagnoses ISP blocking vs
+                        dev-side outages
+      - Soundings:      Network adapters, local IP, public IP
+      - Hold inventory: Windrose install detection and executable versions
+      - Watch posts:    Firewall profile and Steam/Windrose rules
+      - Crew roster:    Steam and Windrose process state
+      - Log book:       Recent application and system errors
+      - Spyglass:       Optional server reachability (DNS, ping, TCP, trace)
+      - Salvage:        Collected Config/SaveProfiles/ServerDescription/logs
+      - Save hold:     RocksDB save health check (LOCK file, MANIFEST, SST/WAL inventory)
 
-      2. Can't reach server  - Everything in mode 1, plus DNS resolution,
-                               ping, TCP port tests, and traceroute to a
-                               specific server IP or hostname.
-
-      3. Shipwright          - Dedicated server wizard:
-                                 - Setup: find game install, copy server out
-                                 - Save transfer: client <-> server with
-                                   backup, ID triple-match validation, and
-                                   pre-flight process check
-                                 - Validate: check config IDs without moving files
-
-    Outputs a timestamped chest on the Desktop:
-      CaptainsLog.txt           - full human-readable report
-      CaptainsLog.md            - pasteable markdown for Discord/forums
-      CaptainsLog_REDACTED.txt  - optional scrubbed copy safe to post publicly
-      CaptainsLog_REDACTED.md   - optional scrubbed markdown
-      Manifest.csv              - pass/warn/fail findings
-      Salvage/                  - collected game config and log files
-      Chest_<timestamp>.zip     - the whole chest sealed for transport
-
-    Shipwright mode does NOT produce a log - it is interactive only.
+    Outputs to a timestamped chest on yer Desktop:
+      - CaptainsLog.txt           - full human-readable report
+      - CaptainsLog.md            - pasteable markdown for Discord/forum
+      - CaptainsLog_REDACTED.txt  - optional scrubbed copy safe to post publicly
+      - CaptainsLog_REDACTED.md   - optional scrubbed markdown version
+      - Manifest.csv              - pass/warn/fail findings
+      - Salvage/                  - collected game files (SaveProfiles, Config, logs)
+      - Chest_<timestamp>.zip     - the whole chest, sealed for transport
 
 .PARAMETER OutputPath
     Root folder for the chest. Default: Desktop\WindroseCaptainChest
 
 .PARAMETER ServerIP
-    Server IP or hostname to test against (mode 2 only).
+    Optional server IP or hostname to sound out.
 
 .PARAMETER ServerPort
     Port to test. Default: 7777.
 
 .PARAMETER Mode
-    ConnectionTrouble | CantReachServer | Shipwright | ''
-    Default: prompts interactively.
+    Full | Quick | LocalOnly. Default prompts interactively.
 
 .PARAMETER SkipTraceRoute
-    Skip tracert in mode 2 (saves ~30 seconds).
+    Skip the tracert step (saves ~30 seconds).
 
 .PARAMETER SkipNetworkTests
-    Skip all remote network tests including fleet check.
+    Skip all remote tests including public IP lookup.
 
 .PARAMETER NoPause
-    Don't wait for Enter at the end. Useful for automation.
+    Don't wait for a key press at the end. Useful for automation.
 
 .PARAMETER Redact
-    Automatically create redacted copy without prompting.
+    Automatically create a redacted version of the report without prompting.
+    Useful for automation. Strips hostname, username, IPs, MACs, file paths.
 
 .PARAMETER NoRedactPrompt
-    Skip the redacted-copy prompt entirely.
+    Skip the "create redacted version?" prompt at the end (don't create one).
+
+.PARAMETER SkipServiceCheck
+    Skip the Windrose backend service reachability check.
 
 .EXAMPLE
     .\CaptainsChest.ps1
-    .\CaptainsChest.ps1 -Mode ConnectionTrouble -NoPause
-    .\CaptainsChest.ps1 -Mode CantReachServer -ServerIP 1.2.3.4 -NoPause
-    .\CaptainsChest.ps1 -Mode Shipwright
+    .\CaptainsChest.ps1 -ServerIP 1.2.3.4 -ServerPort 7777 -Mode Full -NoPause
+    .\CaptainsChest.ps1 -Mode LocalOnly -Redact -NoPause
 #>
 
 param(
     [string]$OutputPath = "$env:USERPROFILE\Desktop\WindroseCaptainChest",
-    [string]$ServerIP   = '',
-    [int]   $ServerPort = 7777,
-    [ValidateSet('ConnectionTrouble','CantReachServer','Shipwright','')]
+    [string]$ServerIP = "",
+    [int]$ServerPort = 7777,
+    [ValidateSet('Full','Quick','LocalOnly','')]
     [string]$Mode = '',
     [switch]$SkipTraceRoute,
     [switch]$SkipNetworkTests,
     [switch]$NoPause,
     [switch]$Redact,
-    [switch]$NoRedactPrompt
+    [switch]$NoRedactPrompt,
+    [switch]$SkipServiceCheck
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
 Set-StrictMode -Version Latest
 
-# -------------------------------------------------------------------------------
-# Configuration - edit these if Windrose changes their infrastructure
-# -------------------------------------------------------------------------------
-
+# --- Port presets (edit here if the charts change) -----------------------------
 $script:WindrosePortPresets = @(
-    [pscustomobject]@{ Port = 7777;  Protocol = 'UDP/TCP'; Purpose = 'Default game / Direct IP host' }
+    [pscustomobject]@{ Port = 7777;  Protocol = 'UDP/TCP'; Purpose = 'Default game port' }
     [pscustomobject]@{ Port = 7778;  Protocol = 'UDP';     Purpose = 'Secondary game port' }
     [pscustomobject]@{ Port = 27015; Protocol = 'UDP/TCP'; Purpose = 'Steam query / master' }
     [pscustomobject]@{ Port = 27036; Protocol = 'UDP/TCP'; Purpose = 'Steam streaming / P2P' }
 )
 
+# --- Windrose backend service endpoints (edit here if they move) ---------------
+# Source: the game's own config and Kraken Express's public statements. These
+# are the services the game's "Connection Services" screen checks. If these
+# show N/A in-game, these checks will tell you whether it's ISP blocking or
+# a genuine backend outage.
 $script:WindroseServiceEndpoints = @(
-    [pscustomobject]@{ Name = 'EU/NA Gateway (primary)';   Host = 'r5coopapigateway-eu-release.windrose.support';    Port = 443;  Region = 'EU & NA' }
-    [pscustomobject]@{ Name = 'EU/NA Gateway (failover)';  Host = 'r5coopapigateway-eu-release-2.windrose.support';  Port = 443;  Region = 'EU & NA' }
-    [pscustomobject]@{ Name = 'CIS Gateway (primary)';     Host = 'r5coopapigateway-ru-release.windrose.support';    Port = 443;  Region = 'CIS' }
-    [pscustomobject]@{ Name = 'CIS Gateway (failover)';    Host = 'r5coopapigateway-ru-release-2.windrose.support';  Port = 443;  Region = 'CIS' }
-    [pscustomobject]@{ Name = 'SEA Gateway (primary)';     Host = 'r5coopapigateway-kr-release.windrose.support';    Port = 443;  Region = 'SEA' }
-    [pscustomobject]@{ Name = 'SEA Gateway (failover)';    Host = 'r5coopapigateway-kr-release-2.windrose.support';  Port = 443;  Region = 'SEA' }
-    [pscustomobject]@{ Name = 'Sentry (error reporting)';  Host = 'sentry.windrose.support';                         Port = 443;  Region = 'Global' }
-    [pscustomobject]@{ Name = 'STUN/TURN (P2P signaling)'; Host = 'windrose.support';                               Port = 3478; Region = 'Global' }
+    [pscustomobject]@{
+        Name   = 'EU/NA API Gateway (primary)'
+        Host   = 'r5coopapigateway-eu-release.windrose.support'
+        Port   = 443
+        Region = 'EU & NA'
+    }
+    [pscustomobject]@{
+        Name   = 'EU/NA API Gateway (failover)'
+        Host   = 'r5coopapigateway-eu-release-2.windrose.support'
+        Port   = 443
+        Region = 'EU & NA'
+    }
+    [pscustomobject]@{
+        Name   = 'RU/CIS API Gateway (primary)'
+        Host   = 'r5coopapigateway-ru-release.windrose.support'
+        Port   = 443
+        Region = 'CIS'
+    }
+    [pscustomobject]@{
+        Name   = 'RU/CIS API Gateway (failover)'
+        Host   = 'r5coopapigateway-ru-release-2.windrose.support'
+        Port   = 443
+        Region = 'CIS'
+    }
+    [pscustomobject]@{
+        Name   = 'KR/SEA API Gateway (primary)'
+        Host   = 'r5coopapigateway-kr-release.windrose.support'
+        Port   = 443
+        Region = 'SEA (South Korea)'
+    }
+    [pscustomobject]@{
+        Name   = 'KR/SEA API Gateway (failover)'
+        Host   = 'r5coopapigateway-kr-release-2.windrose.support'
+        Port   = 443
+        Region = 'SEA (South Korea)'
+    }
+    [pscustomobject]@{
+        Name   = 'Sentry (error reporting)'
+        Host   = 'sentry.windrose.support'
+        Port   = 443
+        Region = 'Global'
+    }
+    [pscustomobject]@{
+        Name   = 'STUN/TURN (P2P signaling)'
+        Host   = 'windrose.support'
+        Port   = 3478
+        Region = 'Global'
+    }
 )
 
-$script:IspCulpritTable = @(
-    # United States
-    @{ Match = 'Spectrum|Charter';      Name = 'Spectrum (Charter)';     Feature = 'Security Shield';        Toggle = 'My Spectrum app > Internet > Security Shield > OFF';             KnownBlocksWindrose = $true  }
-    @{ Match = 'Comcast|Xfinity';       Name = 'Xfinity (Comcast)';      Feature = 'xFi Advanced Security';  Toggle = 'Xfinity app > WiFi > See Network > Advanced Security > OFF';     KnownBlocksWindrose = $true  }
-    @{ Match = 'Cox Communications';    Name = 'Cox';                    Feature = 'Security Suite';         Toggle = 'Cox panel > Security Suite > disable';                            KnownBlocksWindrose = $false }
-    @{ Match = 'AT&T|AT&amp;T';         Name = 'AT&T';                   Feature = 'ActiveArmor';            Toggle = 'Smart Home Manager app > ActiveArmor > Internet Security > OFF'; KnownBlocksWindrose = $false }
-    @{ Match = 'CenturyLink|Lumen';     Name = 'CenturyLink/Lumen';      Feature = 'Connection Shield';      Toggle = 'centurylink.com/myaccount > Internet > Connection Shield';        KnownBlocksWindrose = $false }
-    @{ Match = 'Verizon';               Name = 'Verizon';                Feature = 'Network Protection';     Toggle = 'My Verizon app > Services > Digital Secure';                     KnownBlocksWindrose = $false }
-    @{ Match = 'T-Mobile';              Name = 'T-Mobile Home Internet'; Feature = 'Network Protection';     Toggle = 'T-Life app > Home Internet > Network settings';                  KnownBlocksWindrose = $false }
-    @{ Match = 'Optimum|Cablevision';   Name = 'Optimum (Altice)';       Feature = 'Internet Protection';    Toggle = 'optimum.net > Internet Security > disable';                      KnownBlocksWindrose = $false }
-    @{ Match = 'Frontier';              Name = 'Frontier';               Feature = 'Secure Whole-Home';      Toggle = 'frontier.com/helpcenter > Internet Security > disable';           KnownBlocksWindrose = $false }
-    # United Kingdom
-    @{ Match = 'British Telecom|BT ';   Name = 'BT';                     Feature = 'Web Protect';            Toggle = 'my.bt.com > Broadband > Manage Web Protect > OFF';               KnownBlocksWindrose = $true  }
-    @{ Match = 'Sky UK|Sky Broadband';  Name = 'Sky';                    Feature = 'Broadband Shield';       Toggle = 'sky.com/mysky > Broadband Shield > None';                        KnownBlocksWindrose = $false }
-    @{ Match = 'Virgin Media';          Name = 'Virgin Media';           Feature = 'Web Safe';               Toggle = 'virginmedia.com/my-account > Web Safe > disable';                KnownBlocksWindrose = $false }
-    @{ Match = 'TalkTalk';              Name = 'TalkTalk';               Feature = 'HomeSafe';               Toggle = 'my.talktalk.co.uk > HomeSafe > disable';                         KnownBlocksWindrose = $false }
-    # Europe
-    @{ Match = 'Ziggo|VodafoneZiggo';   Name = 'Ziggo (NL)';             Feature = 'Default domain filter'; Toggle = 'mijn.ziggo.nl > Security/router settings';                       KnownBlocksWindrose = $true  }
-    @{ Match = 'Orange ';               Name = 'Orange (FR/ES)';         Feature = 'Livebox security';       Toggle = 'Livebox admin 192.168.1.1 > Security > OFF';                     KnownBlocksWindrose = $false }
-    @{ Match = 'Free SAS|Free ';        Name = 'Free (FR)';              Feature = 'Freebox security';       Toggle = 'freebox.fr > Securite > adjust filtering';                        KnownBlocksWindrose = $false }
-    @{ Match = 'Deutsche Telekom';      Name = 'Deutsche Telekom (DE)';  Feature = 'Default firewall';       Toggle = 'Speedport admin > Firewall > customize';                         KnownBlocksWindrose = $false }
-    @{ Match = 'Vodafone';              Name = 'Vodafone (EU)';          Feature = 'Secure Net';             Toggle = 'My Vodafone app > Secure Net > disable';                         KnownBlocksWindrose = $false }
-    # Canada
-    @{ Match = 'Rogers Communications'; Name = 'Rogers (CA)';            Feature = 'Shield';                 Toggle = 'MyRogers app > Internet > Shield > OFF';                         KnownBlocksWindrose = $false }
-    @{ Match = 'Bell Canada';           Name = 'Bell (CA)';              Feature = 'Internet Security';      Toggle = 'MyBell account > Internet > Security > disable';                 KnownBlocksWindrose = $false }
-    @{ Match = 'Telus';                 Name = 'Telus (CA)';             Feature = 'Online Security';        Toggle = 'My Telus > Internet > Online Security';                          KnownBlocksWindrose = $false }
-    # Australia
-    @{ Match = 'Telstra';               Name = 'Telstra (AU)';           Feature = 'Smart Modem security';  Toggle = 'My Telstra app > Home Internet > security settings';             KnownBlocksWindrose = $false }
-    @{ Match = 'Optus';                 Name = 'Optus (AU)';             Feature = 'Internet Security';      Toggle = 'My Optus app > Internet > Security > disable';                   KnownBlocksWindrose = $false }
+# --- Windrose system requirements (edit if the game updates these) -------------
+# Source: windrosewiki.org/requirements as of April 2026.
+# Numbers are "not final and subject to change" per the developers.
+$script:WindroseSpecs = @{
+    OS = @{
+        MinBuild = 19041  # Windows 10 20H1 - any Win10/11 64-bit is fine
+        MinName  = 'Windows 10 64-bit'
+        RecName  = 'Windows 11 64-bit'
+    }
+    CPU = @{
+        MinCores  = 6       # i7-8700K / Ryzen 7 2700X have 6-8 cores, both hit 6
+        RecCores  = 8       # i7-10700 / Ryzen 7 5800X both have 8 cores
+        MinGhz    = 3.2
+        RecGhz    = 3.8
+        MinName   = 'Intel i7-8700K / AMD Ryzen 7 2700X'
+        RecName   = 'Intel i7-10700 / AMD Ryzen 7 5800X'
+    }
+    RAM = @{
+        MinGB = 16
+        RecGB = 32
+    }
+    GPU = @{
+        # GPU tier lookup - higher number = better card
+        # Min = GTX 1080 Ti / RX 6800 (tier 5)
+        # Rec = RTX 3080 / RX 6800 XT  (tier 6)
+        MinTier = 5
+        RecTier = 6
+        MinName = 'NVIDIA GTX 1080 Ti / AMD Radeon RX 6800'
+        RecName = 'NVIDIA RTX 3080 / AMD Radeon RX 6800 XT'
+        MinVramGB = 8
+        RecVramGB = 10
+    }
+    DirectX = @{
+        MinVersion = 12
+        RecVersion = 12
+    }
+    Storage = @{
+        MinFreeGB = 30
+        RecFreeGB = 30
+        SsdRequired = $false  # "strongly recommended" for min, "required" for rec
+    }
+}
+
+# GPU tier table - maps detected GPU name patterns to a performance tier.
+# Tiers: 0=below min, 1=very old, 2=low-mid, 3=mid, 4=upper-mid, 5=min spec, 6=rec spec, 7=above rec
+$script:GpuTierTable = @(
+    # --- Tier 7: above recommended ---
+    @{ Pattern = 'RTX\s*(4070|4080|4090|5070|5080|5090)'; Tier = 7; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RTX\s*(3080|3090)\s*Ti';                Tier = 7; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RX\s*(7800|7900|9070|9080)';            Tier = 7; Vendor = 'AMD' }
+
+    # --- Tier 6: recommended ---
+    @{ Pattern = 'RTX\s*(3080|3090)';                     Tier = 6; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RTX\s*(4060\s*Ti|4070)';                Tier = 6; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RX\s*(6800\s*XT|6900|7700|7800)';       Tier = 6; Vendor = 'AMD' }
+
+    # --- Tier 5: minimum ---
+    @{ Pattern = 'GTX\s*1080\s*Ti';                       Tier = 5; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RTX\s*(2080|3060\s*Ti|3070|4060)';      Tier = 5; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RX\s*(6700\s*XT|6800|5700\s*XT|7600)';  Tier = 5; Vendor = 'AMD' }
+
+    # --- Tier 4: upper-mid (below min but close) ---
+    @{ Pattern = 'RTX\s*(2060|2070|3050|3060)';           Tier = 4; Vendor = 'NVIDIA' }
+    @{ Pattern = 'GTX\s*(1080|1070\s*Ti)';                Tier = 4; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RX\s*(5700|6600|6700|5600\s*XT)';       Tier = 4; Vendor = 'AMD' }
+
+    # --- Tier 3: mid ---
+    @{ Pattern = 'GTX\s*(1070|1660|1060\s*6GB)';          Tier = 3; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RX\s*(580|590|5500\s*XT|6500\s*XT)';    Tier = 3; Vendor = 'AMD' }
+
+    # --- Tier 2: low-mid ---
+    @{ Pattern = 'GTX\s*(1050|1060|1650)';                Tier = 2; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RX\s*(470|480|570|560)';                Tier = 2; Vendor = 'AMD' }
+
+    # --- Tier 1: very old ---
+    @{ Pattern = 'GTX\s*(9[56]0|10[45]0|750|760|770|780)'; Tier = 1; Vendor = 'NVIDIA' }
+    @{ Pattern = 'RX\s*(460|550|460)';                    Tier = 1; Vendor = 'AMD' }
+
+    # --- Tier 0: definitely below min ---
+    @{ Pattern = '(UHD|Iris|HD)\s*Graphics';              Tier = 0; Vendor = 'Intel iGPU' }
+    @{ Pattern = 'Vega\s*\d+';                            Tier = 0; Vendor = 'AMD iGPU' }
 )
 
-$script:ServerSaveRoot = 'R5\Saved\SaveProfiles\Default\RocksDB'
-$script:ServerDescFile = 'ServerDescription.json'
-
-# -------------------------------------------------------------------------------
-# Script-level state
-# -------------------------------------------------------------------------------
-
-$script:RootOut              = $null
-$script:LogsOut              = $null
-$script:ReportFile           = $null
-$script:MarkdownFile         = $null
-$script:Summary              = New-Object System.Collections.Generic.List[object]
-$script:PublicIP             = $null
-$script:WindroseInstallCache = $null
+$script:RootOut      = $null
+$script:LogsOut      = $null
+$script:ReportFile   = $null
+$script:MarkdownFile = $null
+$script:Summary      = New-Object System.Collections.Generic.List[object]
 
 # -------------------------------------------------------------------------------
 # Banner
 # -------------------------------------------------------------------------------
 
 function Show-Banner {
-    Write-Host @"
+    $banner = @"
 
      __        _____ _   _ ____  ____   ___  ____  _____
      \ \      / /_ _| \ | |  _ \|  _ \ / _ \/ ___|| ____|
       \ \ /\ / / | ||  \| | | | | |_) | | | \___ \|  _|
        \ V  V /  | || |\  | |_| |  _ <| |_| |___) | |___
         \_/\_/  |___|_| \_|____/|_| \_\\___/|____/|_____|
-                 Captain's Chest  -  v2.0.0
-                   "No crew left ashore"
+                 Captain's Chest  -  diagnostic toolkit
+                        "No crew left ashore"
 
-"@ -ForegroundColor Yellow
+"@
+    Write-Host $banner -ForegroundColor Yellow
 }
 
 # -------------------------------------------------------------------------------
@@ -173,8 +261,8 @@ function Show-Banner {
 # -------------------------------------------------------------------------------
 
 function Initialize-Output {
-    $ts = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
-    $script:RootOut      = Join-Path $OutputPath $ts
+    $timestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
+    $script:RootOut      = Join-Path $OutputPath $timestamp
     $script:LogsOut      = Join-Path $script:RootOut 'Salvage'
     New-Item -ItemType Directory -Path $script:RootOut -Force | Out-Null
     New-Item -ItemType Directory -Path $script:LogsOut -Force | Out-Null
@@ -192,15 +280,10 @@ function Write-Section {
 }
 
 function Write-Line {
-    param([string]$Text = '')
+    param([string]$Text)
     Write-Host $Text
     Add-Content -Path $script:ReportFile -Value $Text
 }
-
-function Write-Ok   { param([string]$T) Write-Host "  [OK  ] $T" -ForegroundColor Green;  Add-Content -Path $script:ReportFile -Value "  [OK  ] $T" }
-function Write-Warn { param([string]$T) Write-Host "  [WARN] $T" -ForegroundColor Yellow; Add-Content -Path $script:ReportFile -Value "  [WARN] $T" }
-function Write-Fail { param([string]$T) Write-Host "  [FAIL] $T" -ForegroundColor Red;    Add-Content -Path $script:ReportFile -Value "  [FAIL] $T" }
-function Write-Info { param([string]$T) Write-Host "  [INFO] $T" -ForegroundColor Gray;   Add-Content -Path $script:ReportFile -Value "  [INFO] $T" }
 
 function Add-Finding {
     param(
@@ -209,221 +292,941 @@ function Add-Finding {
         [string]$Check,
         [string]$Details
     )
-    $script:Summary.Add([pscustomobject]@{ Status = $Status; Check = $Check; Details = $Details }) | Out-Null
+    $script:Summary.Add([pscustomobject]@{
+        Status  = $Status
+        Check   = $Check
+        Details = $Details
+    }) | Out-Null
 }
 
 function Run-CommandCapture {
-    param([string]$Label, [scriptblock]$Command)
+    param(
+        [string]$Label,
+        [scriptblock]$Command
+    )
     Write-Section $Label
     try {
         $result = & $Command 2>&1 | Out-String
         if ([string]::IsNullOrWhiteSpace($result)) { $result = '[no output]' }
         Write-Line $result.TrimEnd()
-    } catch {
+    }
+    catch {
         Write-Line "[error] $($_.Exception.Message)"
     }
 }
 
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-    return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $principal = New-Object Security.Principal.WindowsPrincipal($id)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
 # -------------------------------------------------------------------------------
-# Main menu
+# Prompts
 # -------------------------------------------------------------------------------
 
 function Prompt-Menu {
     if ($Mode) { return $Mode }
     Write-Host ''
     Write-Host 'Chart yer course, Captain:' -ForegroundColor Green
-    Write-Host '  1. Connection trouble  - ISP, fleet endpoints, firewall, game version (the 90% case)'
-    Write-Host '  2. Can''t reach server  - above + DNS / ping / tracert to a specific server'
-    Write-Host '  3. Shipwright          - dedicated server setup, save transfer, config validation'
+    Write-Host '  1. Full voyage  - ship, shore, and sound out a distant port'
+    Write-Host '  2. Quick sweep  - ship info and a quick port test'
+    Write-Host '  3. Stay ashore  - ship and shore only, no remote soundings'
     Write-Host ''
-    $choice = Read-Host 'Choice (1-3) [default 1]'
+    $choice = Read-Host 'Yer choice (1-3) [default 1]'
     switch ($choice) {
-        '2'     { return 'CantReachServer' }
-        '3'     { return 'Shipwright' }
-        default { return 'ConnectionTrouble' }
+        '2' { return 'Quick' }
+        '3' { return 'LocalOnly' }
+        default { return 'Full' }
     }
 }
 
 function Prompt-ServerTarget {
-    $ip   = $ServerIP
-    $port = $ServerPort
-    if ([string]::IsNullOrWhiteSpace($ip)) { $ip = Read-Host 'Enter server IP or hostname' }
-    $pi = Read-Host "Port [default $port]"
-    if (-not [string]::IsNullOrWhiteSpace($pi)) {
-        $parsed = 0
-        if ([int]::TryParse($pi, [ref]$parsed)) { $port = $parsed }
+    $targetIP   = $ServerIP
+    $targetPort = $ServerPort
+
+    if ([string]::IsNullOrWhiteSpace($targetIP)) {
+        $targetIP = Read-Host "Name the port to sound (IP or hostname)"
     }
-    return [pscustomobject]@{ IP = $ip.Trim(); Port = $port }
+
+    $portInput = Read-Host "Port number, or press Enter for $targetPort"
+    if (-not [string]::IsNullOrWhiteSpace($portInput)) {
+        $parsed = 0
+        if ([int]::TryParse($portInput, [ref]$parsed)) { $targetPort = $parsed }
+    }
+
+    return [pscustomobject]@{
+        IP   = $targetIP.Trim()
+        Port = $targetPort
+    }
 }
 
 # -------------------------------------------------------------------------------
-# Network
+# Ship's papers
 # -------------------------------------------------------------------------------
+
+function Get-OsInfo {
+    Write-Section "Ship's papers (OS)"
+
+    # Get-ComputerInfo's WindowsProductName can incorrectly report "Windows 10 Pro"
+    # on Windows 11 systems. Use the registry ProductName and cross-reference with
+    # build number to get the right marketing name.
+    $os = Get-CimInstance Win32_OperatingSystem
+    $build = [int]$os.BuildNumber
+    $arch  = $os.OSArchitecture
+
+    # Build 22000+ is Windows 11; below that is Windows 10
+    $edition = try {
+        (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name ProductName).ProductName
+    } catch { $os.Caption }
+
+    $marketingName = if ($build -ge 22000) {
+        $edition -replace 'Windows 10', 'Windows 11'
+    } else {
+        $edition
+    }
+
+    $displayVersion = try {
+        (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name DisplayVersion -ErrorAction Stop).DisplayVersion
+    } catch { '' }
+
+    Write-Line ("Product:      {0}" -f $marketingName)
+    if ($displayVersion) { Write-Line ("Version:      {0}" -f $displayVersion) }
+    Write-Line ("Build:        {0}" -f $build)
+    Write-Line ("Architecture: {0}" -f $arch)
+    Write-Line ("Host:         {0}" -f $env:COMPUTERNAME)
+}
+
+function Get-CpuAndMemory {
+    Run-CommandCapture -Label 'Engine room (CPU and memory)' -Command {
+        Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed |
+            Format-List
+        Get-CimInstance Win32_ComputerSystem |
+            Select-Object @{N='TotalPhysicalMemoryGB';E={[math]::Round($_.TotalPhysicalMemory/1GB,2)}} |
+            Format-List
+    }
+}
+
+function Get-GpuVramGB {
+    param([string]$GpuName)
+
+    # Win32_VideoController.AdapterRAM is a UInt32 that overflows at 4GB - any
+    # GPU with more VRAM than that will report 4 (or a bogus smaller number).
+    # Try multiple registry locations where Windows stores the real value as
+    # a 64-bit QWORD.
+
+    # Method 1: HKLM\SYSTEM\CurrentControlSet\Control\Video - most reliable,
+    # stores HardwareInformation.qwMemorySize as QWORD for each adapter.
+    try {
+        $videoRoot = 'HKLM:\SYSTEM\CurrentControlSet\Control\Video'
+        if (Test-Path $videoRoot) {
+            $guidFolders = Get-ChildItem $videoRoot -ErrorAction SilentlyContinue |
+                Where-Object { $_.PSChildName -match '^\{[0-9A-Fa-f\-]+\}$' }
+            foreach ($guid in $guidFolders) {
+                # Each adapter has 0000, 0001, etc. subkeys
+                $subkeys = Get-ChildItem $guid.PSPath -ErrorAction SilentlyContinue |
+                    Where-Object { $_.PSChildName -match '^\d{4}$' }
+                foreach ($sub in $subkeys) {
+                    $props = Get-ItemProperty $sub.PSPath -ErrorAction SilentlyContinue
+                    # Match on DriverDesc which holds the display name
+                    $desc = $props.'DriverDesc'
+                    if (-not $desc) { $desc = $props.'Device Description' }
+                    if ($desc -and $GpuName -and ($desc -eq $GpuName -or $GpuName -like "*$desc*" -or $desc -like "*$GpuName*")) {
+                        $qword = $props.'HardwareInformation.qwMemorySize'
+                        if (-not $qword) { $qword = $props.'HardwareInformation.MemorySize' }
+                        if ($qword -and $qword -gt 0) {
+                            return [math]::Round($qword / 1GB, 1)
+                        }
+                    }
+                }
+            }
+        }
+    } catch { }
+
+    # Method 2: HKLM\SOFTWARE\Microsoft\DirectX - newer Windows versions
+    try {
+        $regPath = 'HKLM:\SOFTWARE\Microsoft\DirectX'
+        if (Test-Path $regPath) {
+            $adapters = Get-ChildItem $regPath -ErrorAction SilentlyContinue | Where-Object {
+                $_.PSChildName -match '^\{[0-9A-Fa-f\-]+\}$'
+            }
+            foreach ($adapter in $adapters) {
+                $props = Get-ItemProperty $adapter.PSPath -ErrorAction SilentlyContinue
+                if ($props.Description -eq $GpuName -and $props.DedicatedVideoMemory) {
+                    return [math]::Round($props.DedicatedVideoMemory / 1GB, 1)
+                }
+            }
+        }
+    } catch { }
+
+    # Method 3: WMI Win32_VideoController but re-read AdapterRAM as an UInt32
+    # overflow hint — if it reports exactly 4294967295 or 4294836224 or a
+    # similar near-4GB value, we know the card is >=4GB but can't tell how much
+    try {
+        $gpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -eq $GpuName } | Select-Object -First 1
+        if ($gpu -and $gpu.AdapterRAM) {
+            $bytes = [uint64]$gpu.AdapterRAM
+            # If it's within 64 MB of the 4GB UInt32 cap, it's definitely overflowed
+            if ($bytes -ge 4227858432) {
+                return 4  # sentinel - caller can treat as "at least 4, real value unknown"
+            }
+            return [math]::Round($bytes / 1GB, 2)
+        }
+    } catch { }
+
+    return $null
+}
+
+function Get-GpuInfoWithDriverAge {
+    Write-Section 'Crow''s nest (GPU)'
+    $gpus = Get-CimInstance Win32_VideoController
+    if (-not $gpus) {
+        Write-Line 'No GPUs sighted.'
+        Add-Finding -Status 'WARN' -Check 'GPU' -Details 'No video controllers were enumerated.'
+        return
+    }
+
+    foreach ($gpu in $gpus) {
+        $driverDate = $null
+        try {
+            if ($gpu.DriverDate) {
+                $driverDate = [Management.ManagementDateTimeConverter]::ToDateTime($gpu.DriverDate)
+            }
+        } catch { }
+
+        # Prefer registry-sourced VRAM (fixes 4GB cap bug), fall back to WMI
+        $vramGB = Get-GpuVramGB -GpuName $gpu.Name
+        if (-not $vramGB -and $gpu.AdapterRAM) {
+            $vramGB = [math]::Round($gpu.AdapterRAM / 1GB, 2)
+        }
+        $vramDisplay = if ($vramGB) { "$vramGB" } else { 'unknown' }
+
+        Write-Line ("Name:           {0}" -f $gpu.Name)
+        Write-Line ("Driver Version: {0}" -f $gpu.DriverVersion)
+        if ($driverDate) {
+            $age = (Get-Date) - $driverDate
+            Write-Line ("Driver Date:    {0:yyyy-MM-dd} ({1} days old)" -f $driverDate, [int]$age.TotalDays)
+            if ($age.TotalDays -gt 365) {
+                Add-Finding -Status 'WARN' -Check 'GPU driver age' -Details ("{0} driver is {1} days old - consider updating." -f $gpu.Name, [int]$age.TotalDays)
+            } elseif ($age.TotalDays -gt 180) {
+                Add-Finding -Status 'INFO' -Check 'GPU driver age' -Details ("{0} driver is {1} days old." -f $gpu.Name, [int]$age.TotalDays)
+            } else {
+                Add-Finding -Status 'PASS' -Check 'GPU driver age' -Details ("{0} driver is fresh ({1} days old)." -f $gpu.Name, [int]$age.TotalDays)
+            }
+        } else {
+            Write-Line 'Driver Date:    unknown'
+            Add-Finding -Status 'INFO' -Check 'GPU driver age' -Details ("{0} driver date could not be determined." -f $gpu.Name)
+        }
+        Write-Line ("VRAM (GB):      {0}" -f $vramDisplay)
+        Write-Line ''
+    }
+}
+
+# -------------------------------------------------------------------------------
+# Seaworthy check (min/recommended spec comparison)
+# -------------------------------------------------------------------------------
+
+function Get-GpuTier {
+    param([string]$GpuName)
+
+    if ([string]::IsNullOrWhiteSpace($GpuName)) { return -1 }
+
+    foreach ($entry in $script:GpuTierTable) {
+        if ($GpuName -match $entry.Pattern) {
+            return $entry.Tier
+        }
+    }
+    return -1  # unknown
+}
+
+function Get-DirectXVersion {
+    try {
+        $tempFile = Join-Path $env:TEMP "dxdiag_$(Get-Random).txt"
+        Start-Process -FilePath 'dxdiag' -ArgumentList "/t `"$tempFile`"" -Wait -NoNewWindow -ErrorAction Stop
+        # dxdiag runs async sometimes - give it a moment
+        $waited = 0
+        while (-not (Test-Path $tempFile) -and $waited -lt 10) {
+            Start-Sleep -Seconds 1
+            $waited++
+        }
+        if (Test-Path $tempFile) {
+            $content = Get-Content $tempFile -Raw
+            Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+            if ($content -match 'DirectX Version:\s*DirectX\s+(\d+)') {
+                return [int]$matches[1]
+            }
+        }
+    } catch { }
+    return $null
+}
+
+function Get-SystemDriveIsSSD {
+    param([string]$DriveLetter = 'C')
+    try {
+        $partition = Get-Partition -DriveLetter $DriveLetter -ErrorAction Stop
+        $disk = Get-PhysicalDisk | Where-Object { $_.DeviceId -eq $partition.DiskNumber }
+        if ($disk) {
+            return ($disk.MediaType -eq 'SSD')
+        }
+    } catch { }
+    return $null  # unknown
+}
+
+function Test-Seaworthy {
+    Write-Section 'Seaworthy check (minimum/recommended specs)'
+    $specs = $script:WindroseSpecs
+
+    Write-Line 'Comparing yer ship against the Windrose requirements.'
+    Write-Line ("  Minimum:      CPU {0}, {1} GB RAM, {2}" -f $specs.CPU.MinName, $specs.RAM.MinGB, $specs.GPU.MinName)
+    Write-Line ("  Recommended:  CPU {0}, {1} GB RAM, {2}" -f $specs.CPU.RecName, $specs.RAM.RecGB, $specs.GPU.RecName)
+    Write-Line ''
+
+    # --- OS check ---
+    $os = Get-CimInstance Win32_OperatingSystem
+    $osArch = $os.OSArchitecture
+    $osBuild = [int]($os.BuildNumber)
+    $is64bit = $osArch -match '64'
+    $osDisplay = "$($os.Caption) (build $osBuild, $osArch)"
+    Write-Line ("OS:      {0}" -f $osDisplay)
+
+    if (-not $is64bit) {
+        Write-Line '         [FAIL] Windrose requires a 64-bit OS.'
+        Add-Finding -Status 'FAIL' -Check 'Seaworthy: OS' -Details "64-bit required. Detected: $osArch"
+    } elseif ($osBuild -ge 22000) {
+        Write-Line '         [PASS-REC] Meets recommended (Windows 11).'
+        Add-Finding -Status 'PASS' -Check 'Seaworthy: OS' -Details "Meets recommended ($osDisplay)."
+    } elseif ($osBuild -ge $specs.OS.MinBuild) {
+        Write-Line '         [PASS-MIN] Meets minimum (Windows 10 64-bit).'
+        Add-Finding -Status 'PASS' -Check 'Seaworthy: OS' -Details "Meets minimum ($osDisplay)."
+    } else {
+        Write-Line '         [FAIL] Below minimum Windows 10 build.'
+        Add-Finding -Status 'FAIL' -Check 'Seaworthy: OS' -Details "Below minimum. Detected: $osDisplay"
+    }
+
+    # --- CPU check ---
+    $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+    $cpuCores = [int]$cpu.NumberOfCores
+    $cpuGhz = [math]::Round($cpu.MaxClockSpeed / 1000.0, 2)
+    Write-Line ("CPU:     {0} ({1} cores @ {2} GHz)" -f $cpu.Name.Trim(), $cpuCores, $cpuGhz)
+
+    if ($cpuCores -ge $specs.CPU.RecCores -and $cpuGhz -ge $specs.CPU.RecGhz) {
+        Write-Line '         [PASS-REC] Meets recommended CPU.'
+        Add-Finding -Status 'PASS' -Check 'Seaworthy: CPU' -Details "Meets recommended ($cpuCores cores, $cpuGhz GHz)."
+    } elseif ($cpuCores -ge $specs.CPU.MinCores -and $cpuGhz -ge $specs.CPU.MinGhz) {
+        Write-Line '         [PASS-MIN] Meets minimum CPU.'
+        Add-Finding -Status 'PASS' -Check 'Seaworthy: CPU' -Details "Meets minimum ($cpuCores cores, $cpuGhz GHz). Recommended: $($specs.CPU.RecCores) cores, $($specs.CPU.RecGhz)+ GHz."
+    } else {
+        Write-Line '         [FAIL] Below minimum CPU.'
+        Add-Finding -Status 'FAIL' -Check 'Seaworthy: CPU' -Details "Below minimum ($cpuCores cores, $cpuGhz GHz). Min: $($specs.CPU.MinCores) cores, $($specs.CPU.MinGhz)+ GHz."
+    }
+
+    # --- RAM check ---
+    $ramBytes = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
+    $ramGB = [math]::Round($ramBytes / 1GB, 2)
+    Write-Line ("RAM:     {0} GB" -f $ramGB)
+
+    if ($ramGB -ge $specs.RAM.RecGB) {
+        Write-Line '         [PASS-REC] Meets recommended RAM.'
+        Add-Finding -Status 'PASS' -Check 'Seaworthy: RAM' -Details "Meets recommended ($ramGB GB)."
+    } elseif ($ramGB -ge $specs.RAM.MinGB) {
+        Write-Line ('         [PASS-MIN] Meets minimum. Recommended is {0} GB.' -f $specs.RAM.RecGB)
+        Add-Finding -Status 'PASS' -Check 'Seaworthy: RAM' -Details "Meets minimum ($ramGB GB). Recommended: $($specs.RAM.RecGB) GB."
+    } else {
+        Write-Line '         [FAIL] Below minimum RAM.'
+        Add-Finding -Status 'FAIL' -Check 'Seaworthy: RAM' -Details "Below minimum ($ramGB GB). Min: $($specs.RAM.MinGB) GB."
+    }
+
+    # --- GPU check ---
+    $gpus = Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic|Remote|Meta|Mirror' }
+    $bestTier = -1
+    $bestGpu = $null
+    foreach ($g in $gpus) {
+        $tier = Get-GpuTier -GpuName $g.Name
+        if ($tier -gt $bestTier) {
+            $bestTier = $tier
+            $bestGpu = $g
+        }
+    }
+
+    if ($bestGpu) {
+        # Prefer registry lookup (fixes 4GB WMI overflow), fall back to WMI
+        $vramGB = Get-GpuVramGB -GpuName $bestGpu.Name
+        if (-not $vramGB -and $bestGpu.AdapterRAM) {
+            $vramGB = [math]::Round($bestGpu.AdapterRAM / 1GB, 2)
+        }
+        $vramDisplay = if ($vramGB) { "$vramGB GB VRAM" } else { 'VRAM unknown' }
+        Write-Line ("GPU:     {0} ({1})" -f $bestGpu.Name, $vramDisplay)
+
+        if ($bestTier -eq -1) {
+            Write-Line '         [MANUAL] Could not auto-classify this GPU. Compare manually to the requirements above.'
+            Add-Finding -Status 'INFO' -Check 'Seaworthy: GPU' -Details "GPU '$($bestGpu.Name)' not in lookup table - check manually against $($specs.GPU.MinName) / $($specs.GPU.RecName)."
+        } elseif ($bestTier -ge $specs.GPU.RecTier) {
+            Write-Line '         [PASS-REC] Meets recommended GPU tier.'
+            Add-Finding -Status 'PASS' -Check 'Seaworthy: GPU' -Details "$($bestGpu.Name) meets recommended tier."
+        } elseif ($bestTier -ge $specs.GPU.MinTier) {
+            Write-Line '         [PASS-MIN] Meets minimum GPU tier.'
+            Add-Finding -Status 'PASS' -Check 'Seaworthy: GPU' -Details "$($bestGpu.Name) meets minimum tier. Recommended: $($specs.GPU.RecName)."
+        } else {
+            Write-Line '         [FAIL] Below minimum GPU tier.'
+            Add-Finding -Status 'FAIL' -Check 'Seaworthy: GPU' -Details "$($bestGpu.Name) below minimum. Min: $($specs.GPU.MinName)."
+        }
+    } else {
+        Write-Line 'GPU:     no suitable adapter detected'
+        Add-Finding -Status 'WARN' -Check 'Seaworthy: GPU' -Details 'No GPU detected or only basic/virtual adapters present.'
+    }
+
+    # --- DirectX check ---
+    Write-Line ''
+    Write-Line 'DirectX: querying dxdiag (this takes a few seconds)...'
+    $dxVersion = Get-DirectXVersion
+    if ($dxVersion) {
+        Write-Line ("         DirectX {0} detected" -f $dxVersion)
+        if ($dxVersion -ge $specs.DirectX.MinVersion) {
+            Write-Line '         [PASS] Meets DirectX requirement.'
+            Add-Finding -Status 'PASS' -Check 'Seaworthy: DirectX' -Details "DirectX $dxVersion (required: $($specs.DirectX.MinVersion))."
+        } else {
+            Write-Line '         [FAIL] Below minimum DirectX version.'
+            Add-Finding -Status 'FAIL' -Check 'Seaworthy: DirectX' -Details "DirectX $dxVersion detected. Required: $($specs.DirectX.MinVersion)."
+        }
+    } else {
+        Write-Line '         [UNKNOWN] Could not parse DirectX version from dxdiag.'
+        Add-Finding -Status 'INFO' -Check 'Seaworthy: DirectX' -Details "DirectX version could not be determined via dxdiag."
+    }
+
+    # --- Storage check ---
+    Write-Line ''
+    $targetDrive = $null
+    $installs = @(Find-WindroseInstall)   # force array even if single result
+    if ($installs -and $installs.Count -gt 0) {
+        # Robustly extract a drive letter from the first install path. Guards
+        # against any upstream weirdness with array shape or path concatenation.
+        $firstPath = [string]$installs[0]
+        if ($firstPath -match '^([A-Za-z]):\\') {
+            $targetDrive = $matches[1].ToUpper()
+        }
+    }
+
+    if ($targetDrive) {
+        Write-Line ("Storage: checking drive {0}: (Windrose install drive)" -f $targetDrive)
+    } else {
+        $targetDrive = 'C'
+        Write-Line 'Storage: checking drive C: (no Windrose install found - default)'
+    }
+
+    $drive = Get-PSDrive -Name $targetDrive -ErrorAction SilentlyContinue
+    if ($drive) {
+        $freeGB = [math]::Round($drive.Free / 1GB, 2)
+        Write-Line ("         Free space: {0} GB" -f $freeGB)
+
+        if ($freeGB -ge $specs.Storage.RecFreeGB) {
+            Write-Line ('         [PASS] Meets {0} GB requirement.' -f $specs.Storage.MinFreeGB)
+            Add-Finding -Status 'PASS' -Check 'Seaworthy: Storage' -Details "$freeGB GB free on $($targetDrive): (need $($specs.Storage.MinFreeGB) GB)."
+        } else {
+            Write-Line ('         [FAIL] Below {0} GB requirement.' -f $specs.Storage.MinFreeGB)
+            Add-Finding -Status 'FAIL' -Check 'Seaworthy: Storage' -Details "Only $freeGB GB free on $($targetDrive):. Need $($specs.Storage.MinFreeGB) GB."
+        }
+
+        # SSD check
+        $isSsd = Get-SystemDriveIsSSD -DriveLetter $targetDrive
+        if ($isSsd -eq $true) {
+            Write-Line '         [PASS] SSD detected (recommended).'
+            Add-Finding -Status 'PASS' -Check 'Seaworthy: SSD' -Details "Drive $($targetDrive): is an SSD."
+        } elseif ($isSsd -eq $false) {
+            Write-Line '         [WARN] HDD detected - SSD is strongly recommended for Windrose.'
+            Add-Finding -Status 'WARN' -Check 'Seaworthy: SSD' -Details "Drive $($targetDrive): is an HDD. SSD strongly recommended."
+        } else {
+            Write-Line '         [UNKNOWN] Could not determine drive type.'
+            Add-Finding -Status 'INFO' -Check 'Seaworthy: SSD' -Details "Could not determine if drive $($targetDrive): is SSD or HDD."
+        }
+    } else {
+        Write-Line '         [WARN] Could not read drive info.'
+        Add-Finding -Status 'WARN' -Check 'Seaworthy: Storage' -Details "Could not read drive $($targetDrive):"
+    }
+
+    Write-Line ''
+    Write-Line 'Note: Windrose is in Early Access - the developers state that requirements are'
+    Write-Line 'not final. For self-hosted servers, add RAM on top of these numbers.'
+}
+
+# -------------------------------------------------------------------------------
+# Soundings (network)
+# -------------------------------------------------------------------------------
+
+function Get-LocalNetworkSummary {
+    Write-Section 'Home waters (local network)'
+
+    $profiles = Get-NetConnectionProfile
+    foreach ($p in $profiles) {
+        Write-Line ("Network: {0} | Category: {1} | IPv4: {2} | IPv6: {3}" -f $p.Name, $p.NetworkCategory, $p.IPv4Connectivity, $p.IPv6Connectivity)
+        if ($p.NetworkCategory -eq 'Public') {
+            Add-Finding -Status 'WARN' -Check 'Network profile' -Details ("Adapter profile '{0}' is Public - firewall may be stricter." -f $p.Name)
+        }
+    }
+
+    $adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }
+    foreach ($a in $adapters) {
+        Write-Line ("Adapter up: {0} | {1} | {2}" -f $a.Name, $a.InterfaceDescription, $a.LinkSpeed)
+    }
+}
+
+$script:PublicIP = $null
 
 function Get-PublicIP {
     if ($SkipNetworkTests) { return }
-    Write-Section 'Public IP'
-    foreach ($url in @('https://api.ipify.org','https://ifconfig.me/ip','https://icanhazip.com')) {
+    Write-Section 'Flag on the mast (public IP)'
+
+    $endpoints = @(
+        'https://api.ipify.org',
+        'https://ifconfig.me/ip',
+        'https://icanhazip.com'
+    )
+
+    $publicIP = $null
+    foreach ($url in $endpoints) {
         try {
-            $ip = (Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5).Content.Trim()
-            if ($ip -match '^\d{1,3}(\.\d{1,3}){3}$') {
-                Write-Line "Public IP: $ip  (via $url)"
-                Add-Finding -Status 'PASS' -Check 'Public IP' -Details "Resolved: $ip"
-                $script:PublicIP = $ip
-                return
+            $publicIP = (Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5).Content.Trim()
+            if ($publicIP -match '^\d{1,3}(\.\d{1,3}){3}$') {
+                Write-Line ("Public IP: {0}  (source: {1})" -f $publicIP, $url)
+                Add-Finding -Status 'PASS' -Check 'Public IP' -Details "Public IP resolved: $publicIP"
+                $script:PublicIP = $publicIP
+                break
+            } else {
+                $publicIP = $null
             }
         } catch { continue }
     }
-    Write-Line 'Could not determine public IP.'
-    Add-Finding -Status 'WARN' -Check 'Public IP' -Details 'Public IP lookup failed.'
+
+    if (-not $publicIP) {
+        Write-Line 'Could not determine public IP from any endpoint.'
+        Add-Finding -Status 'WARN' -Check 'Public IP' -Details 'Public IP lookup failed on all endpoints.'
+    }
 }
 
+function Test-DnsResolution {
+    param([string]$Target)
+    Write-Section 'Charting the course (DNS)'
+    try {
+        $results = Resolve-DnsName -Name $Target -ErrorAction Stop
+        $addresses = $results | Where-Object { $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique
+        if ($addresses) {
+            foreach ($a in $addresses) { Write-Line "Resolved: $Target -> $a" }
+            Add-Finding -Status 'PASS' -Check 'DNS resolution' -Details "Hostname resolved for $Target."
+        } else {
+            Write-Line 'No IP addresses returned.'
+            Add-Finding -Status 'WARN' -Check 'DNS resolution' -Details "No addresses for $Target."
+        }
+    } catch {
+        Write-Line "DNS resolution failed: $($_.Exception.Message)"
+        Add-Finding -Status 'FAIL' -Check 'DNS resolution' -Details "DNS resolution failed for $Target."
+    }
+}
+
+function Test-BasicPing {
+    param([string]$Target)
+    Write-Section 'Cannon shot (ping)'
+    try {
+        $pings = Test-Connection -TargetName $Target -Count 4 -ErrorAction Stop
+        foreach ($p in $pings) {
+            Write-Line ("Reply from {0} in {1} ms" -f $p.Address, $p.Latency)
+        }
+        $avg = [math]::Round((($pings | Measure-Object -Property Latency -Average).Average), 2)
+        Add-Finding -Status 'PASS' -Check 'Ping' -Details "Ping succeeded. Average latency: $avg ms."
+    } catch {
+        Write-Line "Ping failed or was blocked: $($_.Exception.Message)"
+        Add-Finding -Status 'WARN' -Check 'Ping' -Details 'Ping failed or ICMP is blocked - not definitive for the game port.'
+    }
+}
+
+function Test-TcpPort {
+    param([string]$Target, [int]$Port)
+    Write-Section "Boarding party (TCP port $Port)"
+    $result = Test-NetConnection -ComputerName $Target -Port $Port -InformationLevel Detailed
+    $result | Out-String | ForEach-Object { Write-Line $_.TrimEnd() }
+
+    if ($result.TcpTestSucceeded) {
+        Add-Finding -Status 'PASS' -Check "TCP $Port" -Details "TCP $Port is reachable on $Target."
+    } else {
+        Add-Finding -Status 'FAIL' -Check "TCP $Port" -Details "TCP $Port not reachable on $Target. Game may use UDP - inconclusive alone."
+    }
+}
+
+function Test-UdpPortLight {
+    Write-Section "A word on UDP"
+    Write-Line 'PowerShell cannot positively prove a UDP game port is open the way it can for TCP.'
+    Write-Line 'If TCP fails but the game uses UDP, compare with host-side port forwarding and firewall rules.'
+    Add-Finding -Status 'INFO' -Check 'UDP certainty' -Details 'Client-side UDP testing is limited in plain PowerShell.'
+}
+
+function Test-WindrosePortPresets {
+    param([string]$Target)
+    Write-Section 'Sounding the harbor (port presets)'
+    Write-Line 'Testing common Windrose / Steam ports against the target:'
+    foreach ($preset in $script:WindrosePortPresets) {
+        $r = Test-NetConnection -ComputerName $Target -Port $preset.Port -WarningAction SilentlyContinue
+        $state = if ($r.TcpTestSucceeded) { 'OPEN (TCP)' } else { 'closed/filtered (TCP)' }
+        Write-Line ("  Port {0,-6} {1,-10} {2,-35} -> {3}" -f $preset.Port, $preset.Protocol, $preset.Purpose, $state)
+        if ($preset.Protocol -match 'TCP') {
+            $status = if ($r.TcpTestSucceeded) { 'PASS' } else { 'WARN' }
+            Add-Finding -Status $status -Check ("Preset port {0}" -f $preset.Port) -Details ("{0} ({1}) -> {2}" -f $preset.Purpose, $preset.Protocol, $state)
+        }
+    }
+    Write-Line ''
+    Write-Line 'Note: UDP results cannot be confirmed from the client side. "closed/filtered" on a UDP-only port is not conclusive.'
+}
+
+function Run-TraceRoute {
+    param([string]$Target)
+    if ($SkipTraceRoute) { return }
+    Run-CommandCapture -Label 'Ship''s log (trace route)' -Command { tracert $Target }
+}
+
+function Get-BaselineConnectivity {
+    if ($SkipNetworkTests) { return }
+    Run-CommandCapture -Label 'Steam harbor reachable?' -Command {
+        Test-NetConnection store.steampowered.com -Port 443
+    }
+    Run-CommandCapture -Label 'Cloudflare beacon (1.1.1.1:53)' -Command {
+        Test-NetConnection 1.1.1.1 -Port 53
+    }
+    Run-CommandCapture -Label 'Google beacon (8.8.8.8:53)' -Command {
+        Test-NetConnection 8.8.8.8 -Port 53
+    }
+}
+
+# -------------------------------------------------------------------------------
+# Fleet check - Windrose backend service reachability
+# -------------------------------------------------------------------------------
+# Diagnoses whether "N/A" status in the game's Connection Services screen is:
+#   - ISP blocking (DNS returns NXDOMAIN or 127.0.0.1)
+#   - Firewall/AV blocking (DNS timeouts)
+#   - IPv6 preference bug (IPv6 result returned, game is IPv4 only)
+#   - Genuine dev-side outage (all DNS fine but TCP fails)
+#   - User's network totally fine (all reachable - issue is elsewhere)
+# -------------------------------------------------------------------------------
+
+function Resolve-HostDnsDiagnostic {
+    <#
+        Tries to resolve a hostname via BOTH system DNS and Google's 8.8.8.8.
+        Returns a diagnostic object describing what happened - this is the core
+        of the "is your ISP blocking Windrose?" check, straight out of the
+        game's official FAQ.
+    #>
+    param([string]$HostName)
+
+    $result = [pscustomobject]@{
+        HostName        = $HostName
+        SystemStatus    = 'Unknown'  # OK | NXDOMAIN | Timeout | Spoofed | IPv6Only
+        SystemAddresses = @()
+        PublicStatus    = 'Unknown'
+        PublicAddresses = @()
+        Diagnosis       = ''
+    }
+
+    # --- System DNS lookup ---
+    try {
+        $sys = Resolve-DnsName -Name $HostName -Type A -QuickTimeout -ErrorAction Stop
+        $ipv4 = @($sys | Where-Object { $_.Type -eq 'A'    -and $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique)
+        $ipv6 = @($sys | Where-Object { $_.Type -eq 'AAAA' -and $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique)
+
+        if ($ipv4) {
+            $result.SystemAddresses = $ipv4
+            if ($ipv4 -contains '127.0.0.1' -or $ipv4 -contains '0.0.0.0') {
+                $result.SystemStatus = 'Spoofed'
+            } else {
+                $result.SystemStatus = 'OK'
+            }
+        } elseif ($ipv6) {
+            $result.SystemAddresses = $ipv6
+            $result.SystemStatus = 'IPv6Only'
+        } else {
+            $result.SystemStatus = 'NXDOMAIN'
+        }
+    } catch {
+        $msg = $_.Exception.Message
+        if ($msg -match 'does not exist|NXDOMAIN|Non-existent') {
+            $result.SystemStatus = 'NXDOMAIN'
+        } elseif ($msg -match 'timeout|timed out') {
+            $result.SystemStatus = 'Timeout'
+        } else {
+            $result.SystemStatus = 'NXDOMAIN'  # default for any failure
+        }
+    }
+
+    # --- Google public DNS lookup (bypasses ISP DNS) ---
+    try {
+        $pub = Resolve-DnsName -Name $HostName -Type A -Server '8.8.8.8' -QuickTimeout -ErrorAction Stop
+        $ipv4 = @($pub | Where-Object { $_.Type -eq 'A' -and $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique)
+        if ($ipv4) {
+            $result.PublicAddresses = $ipv4
+            $result.PublicStatus = 'OK'
+        } else {
+            $result.PublicStatus = 'NXDOMAIN'
+        }
+    } catch {
+        if ($_.Exception.Message -match 'timeout|timed out') {
+            $result.PublicStatus = 'Timeout'
+        } else {
+            $result.PublicStatus = 'NXDOMAIN'
+        }
+    }
+
+    # --- Diagnose ---
+    if ($result.SystemStatus -eq 'OK') {
+        $result.Diagnosis = 'DNS resolves normally.'
+    } elseif ($result.SystemStatus -eq 'NXDOMAIN' -and $result.PublicStatus -eq 'OK') {
+        $result.Diagnosis = 'ISP BLOCK: Your ISP/router is blocking this domain. It resolves fine on Google DNS (8.8.8.8) but not on your system DNS. See Troubleshooting section for DNS switch instructions.'
+    } elseif ($result.SystemStatus -eq 'NXDOMAIN' -and $result.PublicStatus -eq 'NXDOMAIN') {
+        $result.Diagnosis = 'DOMAIN DOWN: The domain does not resolve anywhere. This may be a dev-side issue (Windrose services genuinely down) or the domain has been retired.'
+    } elseif ($result.SystemStatus -eq 'Spoofed') {
+        $result.Diagnosis = 'DNS SPOOFING: Your DNS is returning a loopback/null address. Your ISP, parental controls, VPN, or custom DNS provider (e.g. NextDNS) is intercepting this domain.'
+    } elseif ($result.SystemStatus -eq 'IPv6Only') {
+        $result.Diagnosis = 'IPv6 ONLY: Only an IPv6 address was returned. Windrose does NOT support IPv6 - you need to prioritize IPv4 (see Troubleshooting section).'
+    } elseif ($result.SystemStatus -eq 'Timeout') {
+        $result.Diagnosis = 'DNS TIMEOUT: Your DNS server did not respond. Check firewall/antivirus, or try switching to Google DNS (8.8.8.8 / 8.8.4.4).'
+    } else {
+        $result.Diagnosis = 'DNS resolution unclear.'
+    }
+
+    return $result
+}
+
+# -------------------------------------------------------------------------------
+# ISP identification and router-security culprit table
+# -------------------------------------------------------------------------------
+# Maps ISP org-name / ASN fragments to the specific router security feature
+# that ISP bundles by default. Based on publicly reported Windrose blocks plus
+# equivalent issues reported for Palworld, Rust, Ark, etc. where the same
+# security features catch legitimate game traffic.
+# Matching is case-insensitive substring matching against the "org" field
+# returned by ipinfo.io.
+# -------------------------------------------------------------------------------
+
+$script:IspCulpritTable = @(
+    # --- United States ---
+    @{ Match = 'Spectrum|Charter';       Name = 'Spectrum (Charter)';      Feature = 'Security Shield';              Toggle = 'My Spectrum app > Internet > Security Shield > OFF';              Country = 'US'; KnownBlocksWindrose = $true }
+    @{ Match = 'Comcast|Xfinity';        Name = 'Xfinity (Comcast)';       Feature = 'xFi Advanced Security';        Toggle = 'Xfinity app > WiFi > See Network > Advanced Security > OFF';      Country = 'US'; KnownBlocksWindrose = $true }
+    @{ Match = 'Cox Communications';     Name = 'Cox';                     Feature = 'Cox Security Suite';           Toggle = 'Cox webmail/panel > Security Suite > disable';                     Country = 'US'; KnownBlocksWindrose = $false }
+    @{ Match = 'AT&T|AT&amp;T';          Name = 'AT&T';                    Feature = 'ActiveArmor';                  Toggle = 'Smart Home Manager app > ActiveArmor > toggle Internet Security'; Country = 'US'; KnownBlocksWindrose = $false }
+    @{ Match = 'CenturyLink|Lumen';      Name = 'CenturyLink/Lumen';       Feature = 'Connection Shield';            Toggle = 'centurylink.com/myaccount > Internet > Connection Shield';         Country = 'US'; KnownBlocksWindrose = $false }
+    @{ Match = 'Verizon';                Name = 'Verizon Fios/5G Home';    Feature = 'Network Protection';           Toggle = 'My Verizon app > Services > Digital Secure';                      Country = 'US'; KnownBlocksWindrose = $false }
+    @{ Match = 'T-Mobile';               Name = 'T-Mobile Home Internet';  Feature = 'Network Protection';           Toggle = 'T-Life app > Home Internet > Network settings';                   Country = 'US'; KnownBlocksWindrose = $false }
+    @{ Match = 'Optimum|Cablevision';    Name = 'Optimum (Altice)';        Feature = 'Optimum Internet Protection';  Toggle = 'optimum.net account > Internet Security > disable';               Country = 'US'; KnownBlocksWindrose = $false }
+    @{ Match = 'Frontier';               Name = 'Frontier';                Feature = 'Secure (Whole-Home)';          Toggle = 'frontier.com/helpcenter > Internet Security > disable';            Country = 'US'; KnownBlocksWindrose = $false }
+
+    # --- United Kingdom ---
+    @{ Match = 'British Telecom|BT ';    Name = 'BT';                      Feature = 'Web Protect';                  Toggle = 'my.bt.com > Broadband > Manage Web Protect > OFF';                Country = 'UK'; KnownBlocksWindrose = $true }
+    @{ Match = 'Sky UK|Sky Broadband';   Name = 'Sky';                     Feature = 'Broadband Shield';             Toggle = 'sky.com/mysky > Broadband Shield > set to None';                  Country = 'UK'; KnownBlocksWindrose = $false }
+    @{ Match = 'Virgin Media';           Name = 'Virgin Media';            Feature = 'Web Safe';                     Toggle = 'virginmedia.com/my-account > Web Safe > disable';                 Country = 'UK'; KnownBlocksWindrose = $false }
+    @{ Match = 'TalkTalk';               Name = 'TalkTalk';                Feature = 'HomeSafe';                     Toggle = 'my.talktalk.co.uk > HomeSafe > disable';                          Country = 'UK'; KnownBlocksWindrose = $false }
+
+    # --- Europe ---
+    @{ Match = 'Ziggo|VodafoneZiggo';    Name = 'Ziggo (NL)';              Feature = 'Default domain filter';        Toggle = 'mijn.ziggo.nl > Security/router settings';                        Country = 'NL'; KnownBlocksWindrose = $true }
+    @{ Match = 'Orange ';                Name = 'Orange (FR/ES)';          Feature = 'Livebox parental/security';    Toggle = 'Livebox admin 192.168.1.1 > Security/parental controls > OFF';    Country = 'FR'; KnownBlocksWindrose = $false }
+    @{ Match = 'Free SAS|Free ';         Name = 'Free (FR)';               Feature = 'Freebox security';             Toggle = 'freebox.fr > Securite > adjust filtering';                         Country = 'FR'; KnownBlocksWindrose = $false }
+    @{ Match = 'Deutsche Telekom';       Name = 'Deutsche Telekom (DE)';   Feature = 'Default firewall';             Toggle = 'Speedport admin > Firewall > customize rules';                    Country = 'DE'; KnownBlocksWindrose = $false }
+    @{ Match = 'Telekom';                Name = 'Telekom (DE/EU)';         Feature = 'Default security';             Toggle = 'Router admin panel > Security settings';                          Country = 'EU'; KnownBlocksWindrose = $false }
+    @{ Match = 'Vodafone';               Name = 'Vodafone (EU)';           Feature = 'Secure Net';                   Toggle = 'My Vodafone app > Secure Net > disable';                          Country = 'EU'; KnownBlocksWindrose = $false }
+
+    # --- Canada ---
+    @{ Match = 'Rogers Communications';  Name = 'Rogers (CA)';             Feature = 'Shield';                       Toggle = 'MyRogers app > Internet > Shield > OFF';                          Country = 'CA'; KnownBlocksWindrose = $false }
+    @{ Match = 'Bell Canada';            Name = 'Bell (CA)';               Feature = 'Internet Security';            Toggle = 'MyBell account > Internet > Security > disable';                  Country = 'CA'; KnownBlocksWindrose = $false }
+    @{ Match = 'Telus';                  Name = 'Telus (CA)';              Feature = 'Online Security';              Toggle = 'My Telus account > Internet > Online Security';                   Country = 'CA'; KnownBlocksWindrose = $false }
+
+    # --- Australia ---
+    @{ Match = 'Telstra';                Name = 'Telstra (AU)';            Feature = 'Smart Modem security';         Toggle = 'My Telstra app > Home Internet > security settings';              Country = 'AU'; KnownBlocksWindrose = $false }
+    @{ Match = 'Optus';                  Name = 'Optus (AU)';              Feature = 'Internet Security';            Toggle = 'My Optus app > Internet > Security > disable';                    Country = 'AU'; KnownBlocksWindrose = $false }
+)
+
 function Get-IspInfo {
+    <#
+        Given a public IP, queries a free IP-to-ISP lookup API and returns
+        { ISP, ASN, City, Country, Raw } or $null if lookups fail.
+        Uses ipinfo.io (no API key required, 50k/month free) with fallback
+        to ip-api.com (45/minute free). Silent failure by design.
+    #>
     param([string]$PublicIP)
+
     if (-not $PublicIP) { return $null }
+
+    # ipinfo.io - most reliable, good org names
     try {
-        $d = (Invoke-WebRequest -Uri "https://ipinfo.io/$PublicIP/json" -UseBasicParsing -TimeoutSec 5).Content | ConvertFrom-Json
-        if ($d.org) { return [pscustomobject]@{ ISP = $d.org; City = $d.city; Country = $d.country } }
+        $resp = Invoke-WebRequest -Uri "https://ipinfo.io/$PublicIP/json" -UseBasicParsing -TimeoutSec 5
+        $data = $resp.Content | ConvertFrom-Json
+        if ($data.org) {
+            return [pscustomobject]@{
+                ISP     = $data.org
+                ASN     = $(if ($data.org -match '^(AS\d+)') { $matches[1] } else { '' })
+                City    = $data.city
+                Country = $data.country
+                Source  = 'ipinfo.io'
+                Raw     = $data
+            }
+        }
     } catch { }
+
+    # ip-api.com fallback
     try {
-        $d = (Invoke-WebRequest -Uri "http://ip-api.com/json/$PublicIP" -UseBasicParsing -TimeoutSec 5).Content | ConvertFrom-Json
-        if ($d.status -eq 'success') { return [pscustomobject]@{ ISP = $d.isp; City = $d.city; Country = $d.countryCode } }
+        $resp = Invoke-WebRequest -Uri "http://ip-api.com/json/$PublicIP" -UseBasicParsing -TimeoutSec 5
+        $data = $resp.Content | ConvertFrom-Json
+        if ($data.status -eq 'success' -and $data.isp) {
+            return [pscustomobject]@{
+                ISP     = $data.isp
+                ASN     = $data.as
+                City    = $data.city
+                Country = $data.countryCode
+                Source  = 'ip-api.com'
+                Raw     = $data
+            }
+        }
     } catch { }
+
     return $null
 }
 
 function Match-IspCulprit {
+    <#
+        Given an ISP org/name string, return the culprit entry from the table
+        if it matches, else $null.
+    #>
     param([string]$IspOrg)
     if (-not $IspOrg) { return $null }
+
     foreach ($entry in $script:IspCulpritTable) {
-        if ($IspOrg -imatch $entry.Match) { return $entry }
+        if ($IspOrg -imatch $entry.Match) {
+            return $entry
+        }
     }
     return $null
 }
 
-function Resolve-HostDnsDiagnostic {
-    param([string]$HostName)
-    $r = [pscustomobject]@{
-        HostName = $HostName; SystemStatus = 'Unknown'; SystemAddresses = @()
-        PublicStatus = 'Unknown'; PublicAddresses = @(); Diagnosis = ''
-    }
-    try {
-        $sys  = Resolve-DnsName -Name $HostName -Type A -QuickTimeout -ErrorAction Stop
-        $ipv4 = @($sys | Where-Object { $_.Type -eq 'A'    } | Select-Object -ExpandProperty IPAddress -Unique)
-        $ipv6 = @($sys | Where-Object { $_.Type -eq 'AAAA' } | Select-Object -ExpandProperty IPAddress -Unique)
-        if ($ipv4) {
-            $r.SystemAddresses = $ipv4
-            $r.SystemStatus = if ($ipv4 -contains '127.0.0.1' -or $ipv4 -contains '0.0.0.0') { 'Spoofed' } else { 'OK' }
-        } elseif ($ipv6) { $r.SystemAddresses = $ipv6; $r.SystemStatus = 'IPv6Only' }
-        else { $r.SystemStatus = 'NXDOMAIN' }
-    } catch { $r.SystemStatus = if ($_.Exception.Message -match 'timeout') { 'Timeout' } else { 'NXDOMAIN' } }
-
-    try {
-        $pub  = Resolve-DnsName -Name $HostName -Type A -Server '8.8.8.8' -QuickTimeout -ErrorAction Stop
-        $ipv4 = @($pub | Where-Object { $_.Type -eq 'A' } | Select-Object -ExpandProperty IPAddress -Unique)
-        if ($ipv4) { $r.PublicAddresses = $ipv4; $r.PublicStatus = 'OK' } else { $r.PublicStatus = 'NXDOMAIN' }
-    } catch { $r.PublicStatus = if ($_.Exception.Message -match 'timeout') { 'Timeout' } else { 'NXDOMAIN' } }
-
-    $r.Diagnosis = switch ($true) {
-        ($r.SystemStatus -eq 'OK')                                            { 'Resolves normally.' }
-        ($r.SystemStatus -eq 'NXDOMAIN' -and $r.PublicStatus -eq 'OK')       { 'ISP BLOCK: resolves on Google 8.8.8.8 but not your system DNS.' }
-        ($r.SystemStatus -eq 'NXDOMAIN' -and $r.PublicStatus -eq 'NXDOMAIN') { 'DOMAIN DOWN: does not resolve anywhere.' }
-        ($r.SystemStatus -eq 'Spoofed')                                       { 'DNS SPOOFING: ISP/VPN returning null address.' }
-        ($r.SystemStatus -eq 'IPv6Only')                                      { 'IPv6 ONLY: Windrose is IPv4-only - prioritize IPv4.' }
-        ($r.SystemStatus -eq 'Timeout')                                       { 'DNS TIMEOUT: check firewall or switch DNS to 8.8.8.8.' }
-        default                                                               { 'DNS result unclear.' }
-    }
-    return $r
-}
-
-# -------------------------------------------------------------------------------
-# ISP detection and fleet check
-# -------------------------------------------------------------------------------
-
 function Show-IspDiagnosis {
-    Write-Section 'Port authority (your ISP)'
-    if (-not $script:PublicIP) { Write-Line 'Public IP unknown - skipping ISP lookup.'; return $null }
+    <#
+        Writes the "Who's your ISP and do they block gaming" section of the report.
+        Called by Test-WindroseServices before the endpoint checks.
+    #>
+    Write-Section "Port authority (your ISP)"
 
-    $isp = Get-IspInfo -PublicIP $script:PublicIP
-    if (-not $isp) {
-        Write-Line 'Could not identify ISP.'
-        Add-Finding -Status 'INFO' -Check 'ISP detection' -Details 'IP lookup returned no ISP info.'
+    if (-not $script:PublicIP) {
+        Write-Line 'Public IP unknown - skipping ISP lookup.'
         return $null
     }
 
-    Write-Line "ISP:     $($isp.ISP)"
-    if ($isp.City)    { Write-Line "City:    $($isp.City)" }
-    if ($isp.Country) { Write-Line "Country: $($isp.Country)" }
+    $isp = Get-IspInfo -PublicIP $script:PublicIP
+    if (-not $isp) {
+        Write-Line 'Could not identify ISP from public IP.'
+        Add-Finding -Status 'INFO' -Check 'ISP detection' -Details 'IP lookup services did not return ISP info.'
+        return $null
+    }
+
+    Write-Line ("ISP:      {0}" -f $isp.ISP)
+    if ($isp.ASN)     { Write-Line ("ASN:      {0}" -f $isp.ASN) }
+    if ($isp.City)    { Write-Line ("City:     {0}" -f $isp.City) }
+    if ($isp.Country) { Write-Line ("Country:  {0}" -f $isp.Country) }
 
     $culprit = Match-IspCulprit -IspOrg $isp.ISP
     if ($culprit) {
         Write-Line ''
-        Write-Line '*** HEADS UP: your ISP ships a security feature that commonly blocks gaming traffic ***'
+        Write-Line '*** HEADS UP: your ISP ships routers with a security feature that ***'
+        Write-Line '*** commonly blocks legitimate gaming traffic, including Windrose. ***'
         Write-Line ''
-        Write-Line "ISP:              $($culprit.Name)"
-        Write-Line "Feature to check: $($culprit.Feature)"
-        Write-Line "Where to toggle:  $($culprit.Toggle)"
+        Write-Line ("ISP:              {0}" -f $culprit.Name)
+        Write-Line ("Feature to check: {0}" -f $culprit.Feature)
+        Write-Line ("Where to toggle:  {0}" -f $culprit.Toggle)
         Write-Line ''
         if ($culprit.KnownBlocksWindrose) {
-            Write-Line '** CONFIRMED to block Windrose. Toggle this OFF before anything else. **'
-            Add-Finding -Status 'WARN' -Check 'ISP' -Details "$($culprit.Name) - $($culprit.Feature) confirmed to block Windrose. Fix: $($culprit.Toggle)"
+            Write-Line '** This ISP has been CONFIRMED to block Windrose specifically. **'
+            Write-Line 'Turning this feature off has fixed the issue for other players on'
+            Write-Line 'this same ISP. If the Fleet check below shows port 3478 blocked or'
+            Write-Line 'any Windrose domain unreachable, toggle this feature off FIRST.'
+            Add-Finding -Status 'WARN' -Check 'ISP' -Details "$($culprit.Name) - $($culprit.Feature) confirmed to block Windrose. Toggle OFF: $($culprit.Toggle)"
         } else {
-            Write-Line 'Known to block P2P games (Rust, Palworld, Ark). Try toggling off if Fleet check fails.'
-            Add-Finding -Status 'INFO' -Check 'ISP' -Details "$($culprit.Name) - toggle $($culprit.Feature) if Fleet check fails. Location: $($culprit.Toggle)"
+            Write-Line 'This feature has been reported to block similar P2P games like'
+            Write-Line 'Rust, Palworld, and Ark. If the Fleet check below shows issues,'
+            Write-Line 'toggling this feature off is worth trying before anything else.'
+            Add-Finding -Status 'INFO' -Check 'ISP' -Details "$($culprit.Name) - consider toggling off $($culprit.Feature) if Fleet check fails. Location: $($culprit.Toggle)"
         }
         return $culprit
     }
 
     Write-Line ''
-    Write-Line 'ISP not in known-culprit list. Still check your ISP app or router admin page'
-    Write-Line 'for any "Security", "Threat Protection", or "Safe Browsing" toggle if the'
-    Write-Line 'Fleet check below shows failures.'
-    Add-Finding -Status 'INFO' -Check 'ISP' -Details "$($isp.ISP) - not in culprit list. Check ISP app for security toggles if connection fails."
+    Write-Line 'Your ISP is not in the known-culprit list. That does NOT mean your ISP'
+    Write-Line 'is safe - many ISPs ship router security features that block gaming'
+    Write-Line 'traffic, and this list only covers the big ones. If the Fleet check'
+    Write-Line 'below shows issues, check your ISP app or router admin page for any'
+    Write-Line '"security", "threat protection", or "safe browsing" toggle and try'
+    Write-Line 'turning it off.'
+    Add-Finding -Status 'INFO' -Check 'ISP' -Details "$($isp.ISP) - not in known-culprit list. Check ISP app/router for security toggles if connection fails."
     return $null
 }
 
 function Show-KnownIspTable {
-    Write-Section 'Known ISP culprits reference'
-    $confirmed = $script:IspCulpritTable | Where-Object { $_.KnownBlocksWindrose }
-    $others    = $script:IspCulpritTable | Where-Object { -not $_.KnownBlocksWindrose }
-    Write-Line 'CONFIRMED to block Windrose:'
-    foreach ($c in $confirmed) { Write-Line "  $($c.Name) - $($c.Toggle)" }
+    <#
+        Reference table printed in the report for humans to visually match
+        "is my ISP the kind that does this?" even if auto-detection failed.
+        Keep it concise - just the ones confirmed to block Windrose or known
+        to block similar P2P games.
+    #>
+    Write-Section 'Known ISP router security features to check'
+    Write-Line 'If your ISP auto-detection above missed you, or if the Fleet check'
+    Write-Line 'shows connection issues, check whether your ISP is on this list and'
+    Write-Line 'toggle off the named feature:'
     Write-Line ''
+
+    $confirmedBlocks = $script:IspCulpritTable | Where-Object { $_.KnownBlocksWindrose }
+    $otherKnown      = $script:IspCulpritTable | Where-Object { -not $_.KnownBlocksWindrose }
+
+    if ($confirmedBlocks) {
+        Write-Line 'CONFIRMED to block Windrose:'
+        Write-Line ('  ' + ('-' * 80))
+        foreach ($c in $confirmedBlocks) {
+            Write-Line ('  {0,-28} {1,-30} [{2}]' -f $c.Name, $c.Feature, $c.Country)
+        }
+        Write-Line ''
+    }
+
     Write-Line 'Known to block similar P2P games (Rust, Palworld, Ark, etc.):'
-    foreach ($c in $others) { Write-Line "  $($c.Name) - $($c.Toggle)" }
+    Write-Line ('  ' + ('-' * 80))
+    foreach ($c in $otherKnown) {
+        Write-Line ('  {0,-28} {1,-30} [{2}]' -f $c.Name, $c.Feature, $c.Country)
+    }
     Write-Line ''
-    Write-Line 'Note: dedicated server hosts (SurvivalServers, LOW.MS, g-portal) are'
-    Write-Line 'NOT affected - they run on business connections without consumer security'
-    Write-Line 'filters. The block is on your residential end, not the host or Windrose.'
+    Write-Line 'Note: Dedicated server hosts (SurvivalServers, LOW.MS, g-portal etc.) do'
+    Write-Line 'NOT have these problems because they run on business-grade connections'
+    Write-Line 'without consumer security filters. The block is almost always on your'
+    Write-Line 'residential end, not on the host or Windrose''s side.'
 }
 
+
 function Write-DirectIpFallback {
-    Write-Line ''
     Write-Line '=== Fallback: Direct IP mode ==='
-    Write-Line 'Connection Services unreachable? You can still host without them:'
-    Write-Line '  Host a Game > Direct IP tab > port 7777'
-    Write-Line '  Share your public IP with your crew.'
-    Write-Line 'Bypasses Windrose Connection Services entirely.'
-    Write-Line 'Requires port 7777 open on your router.'
+    Write-Line ''
+    Write-Line 'Connection Services unreachable? You can host without them.'
+    Write-Line ''
+    Write-Line 'Host a Game -> Direct IP tab -> port 7777'
+    Write-Line 'Share your public IP with your crew'
+    Write-Line ''
+    Write-Line 'This bypasses Windrose Connection Services entirely.'
+    Write-Line 'Requires port 7777 to be open on your router (tested above).'
 }
 
 function Test-WindroseServices {
+    if ($SkipServiceCheck) { return }
     if ($SkipNetworkTests) {
-        Write-Section 'Fleet check'
-        Write-Line 'Skipped (-SkipNetworkTests).'
+        Write-Section 'Fleet check (Windrose services)'
+        Write-Line 'Skipped (-SkipNetworkTests flag).'
         return
     }
 
+    # ISP identification runs first - it informs the diagnosis of anything
+    # that fails in the endpoint checks below.
     $detectedCulprit = Show-IspDiagnosis
 
-    Write-Section 'Fleet check (Windrose backend services)'
-    Write-Line 'Checking all 8 Windrose Connection Service endpoints.'
-    Write-Line 'Compares system DNS vs Google DNS to pinpoint ISP blocking vs outages.'
+    Write-Section 'Fleet check (Windrose services)'
+    Write-Line 'Checking whether Windrose backend services are reachable from this'
+    Write-Line 'machine. If the game shows "N/A" for Connection Services, this tells'
+    Write-Line 'you whether it is ISP blocking, DNS issues, or a genuine outage.'
     Write-Line ''
 
     $anyIspBlock  = $false
@@ -433,990 +1236,683 @@ function Test-WindroseServices {
     $unreachable  = 0
     $dnsIssues    = @()
 
-    foreach ($ep in $script:WindroseServiceEndpoints) {
-        Write-Line "--- $($ep.Name) ($($ep.Region)) ---"
-        $dns = Resolve-HostDnsDiagnostic -HostName $ep.Host
-        Write-Line "  System DNS: $($dns.SystemStatus)$(if ($dns.SystemAddresses) { ' -> ' + ($dns.SystemAddresses -join ', ') })"
-        Write-Line "  Google DNS: $($dns.PublicStatus)$(if ($dns.PublicAddresses) { ' -> ' + ($dns.PublicAddresses -join ', ') })"
-        Write-Line "  Diagnosis:  $($dns.Diagnosis)"
+    foreach ($endpoint in $script:WindroseServiceEndpoints) {
+        Write-Line ("--- {0} ({1}) ---" -f $endpoint.Name, $endpoint.Region)
 
-        switch ($dns.SystemStatus) {
-            'NXDOMAIN' { if ($dns.PublicStatus -eq 'OK') { $anyIspBlock = $true; $dnsIssues += $ep.Host } }
-            'Spoofed'  { $anyDnsSpoof = $true; $dnsIssues += $ep.Host }
-            'IPv6Only' { $anyIpv6Issue = $true }
+        # DNS diagnosis
+        $dns = Resolve-HostDnsDiagnostic -HostName $endpoint.Host
+        Write-Line ("Host:         {0}" -f $endpoint.Host)
+        Write-Line ("System DNS:   {0}{1}" -f $dns.SystemStatus, $(if ($dns.SystemAddresses) { ' -> ' + ($dns.SystemAddresses -join ', ') } else { '' }))
+        Write-Line ("Google DNS:   {0}{1}" -f $dns.PublicStatus, $(if ($dns.PublicAddresses) { ' -> ' + ($dns.PublicAddresses -join ', ') } else { '' }))
+
+        if ($dns.Diagnosis) {
+            Write-Line ("Diagnosis:    {0}" -f $dns.Diagnosis)
         }
 
-        $tcpOk = $false
+        if ($dns.SystemStatus -eq 'NXDOMAIN' -and $dns.PublicStatus -eq 'OK') {
+            $anyIspBlock = $true
+            $dnsIssues += "$($endpoint.Host): ISP blocking"
+        }
+        if ($dns.SystemStatus -eq 'Spoofed') {
+            $anyDnsSpoof = $true
+            $dnsIssues += "$($endpoint.Host): DNS spoofing"
+        }
+        if ($dns.SystemStatus -eq 'IPv6Only') {
+            $anyIpv6Issue = $true
+            $dnsIssues += "$($endpoint.Host): IPv6-only (game needs IPv4)"
+        }
+
+        # TCP connectivity test - only meaningful if we got a real address
         if ($dns.SystemStatus -eq 'OK' -and $dns.SystemAddresses) {
             try {
-                $tcp = [System.Net.Sockets.TcpClient]::new()
-                $ar  = $tcp.BeginConnect($ep.Host, $ep.Port, $null, $null)
-                $tcpOk = $ar.AsyncWaitHandle.WaitOne(3000) -and $tcp.Connected
-                $tcp.Close()
-            } catch { }
+                $tcp = Test-NetConnection -ComputerName $endpoint.Host -Port $endpoint.Port -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
+                if ($tcp.TcpTestSucceeded) {
+                    Write-Line ("TCP {0,-5}:   REACHABLE" -f $endpoint.Port)
+                    $reachable++
+                    Add-Finding -Status 'PASS' -Check "Fleet: $($endpoint.Name)" -Details "Reachable on $($endpoint.Host):$($endpoint.Port)."
+                } else {
+                    Write-Line ("TCP {0,-5}:   BLOCKED or DOWN" -f $endpoint.Port)
+                    $unreachable++
+                    Add-Finding -Status 'FAIL' -Check "Fleet: $($endpoint.Name)" -Details "TCP $($endpoint.Port) unreachable on $($endpoint.Host). DNS resolved but connection refused/filtered."
+                }
+            } catch {
+                Write-Line ("TCP {0,-5}:   ERROR - {1}" -f $endpoint.Port, $_.Exception.Message)
+                $unreachable++
+            }
+        } else {
+            Write-Line ("TCP {0,-5}:   skipped (DNS failed)" -f $endpoint.Port)
+            $unreachable++
+            Add-Finding -Status 'FAIL' -Check "Fleet: $($endpoint.Name)" -Details "$($endpoint.Host) could not be resolved via system DNS. See Fleet check section for diagnosis."
         }
 
-        if ($tcpOk) {
-            Write-Ok "TCP $($ep.Port) reachable"
-            $reachable++
-        } else {
-            Write-Fail "TCP $($ep.Port) NOT reachable"
-            $unreachable++
-            Add-Finding -Status 'FAIL' -Check "Fleet: $($ep.Name)" -Details "TCP $($ep.Port) unreachable. DNS: $($dns.SystemStatus). $($dns.Diagnosis)"
-        }
         Write-Line ''
     }
 
-    Write-Section 'Fleet verdict'
+    # ============== Overall summary with fix suggestions ==============
+    Write-Section 'Fleet check summary'
+    Write-Line ("Reachable endpoints:    {0} of {1}" -f $reachable, $script:WindroseServiceEndpoints.Count)
+    Write-Line ("Unreachable endpoints:  {0}" -f $unreachable)
+    Write-Line ''
 
-    if ($anyDnsSpoof) {
+    if ($reachable -eq $script:WindroseServiceEndpoints.Count) {
+        Write-Line 'GOOD NEWS: All Windrose services are reachable from your machine.'
+        Write-Line 'If the game still shows "N/A" for Connection Services, try restarting'
+        Write-Line 'the game and Steam. If the problem persists, it is likely dev-side.'
+        Add-Finding -Status 'PASS' -Check 'Fleet: Overall' -Details "All $reachable Windrose service endpoints reachable."
+    } elseif ($anyDnsSpoof) {
         Write-Line '*** DNS SPOOFING DETECTED ***'
-        Write-Line 'Your DNS is returning a null/loopback address for Windrose domains.'
-        Write-Line 'Likely cause: ISP safe browsing, VPN, NextDNS with aggressive filtering.'
         Write-Line ''
-        Write-Line 'FIX: Switch to Google DNS (8.8.8.8 / 8.8.4.4):'
-        Write-Line '  Settings > Network & Internet > your connection > Properties'
-        Write-Line '  > Edit DNS > Manual > IPv4 ON'
-        Write-Line '  Preferred: 8.8.8.8   Alternate: 8.8.4.4'
-        Write-Line '  Save, then run: ipconfig /flushdns'
-        Add-Finding -Status 'FAIL' -Check 'Fleet: Overall' -Details 'DNS spoofing. Switch to Google DNS 8.8.8.8.'
-
+        Write-Line 'Your system DNS is returning fake answers for Windrose domains. This is'
+        Write-Line 'almost always caused by:'
+        Write-Line '  - A VPN or proxy that hijacks DNS (disconnect it and try again)'
+        Write-Line '  - Parental control software or network-level content filters'
+        Write-Line '  - A custom DNS provider that blocks gaming endpoints (e.g. NextDNS with'
+        Write-Line '    aggressive filtering, some ISP "safe browsing" features)'
+        Write-Line ''
+        Write-Line 'FIX: Switch to Google DNS (8.8.8.8 / 8.8.4.4) or Cloudflare (1.1.1.1):'
+        Write-Line '  1. Settings > Network & Internet > your active connection > Properties'
+        Write-Line '  2. Edit DNS server assignment > Manual > IPv4 ON'
+        Write-Line '     Preferred: 8.8.8.8   Alternate: 8.8.4.4'
+        Write-Line '  3. Save, then run: ipconfig /flushdns'
+        Add-Finding -Status 'FAIL' -Check 'Fleet: Overall' -Details "DNS spoofing detected. See Fleet check section for fix."
     } elseif ($anyIspBlock) {
-        Write-Line '*** ISP BLOCKING DETECTED ***'
-        Write-Line 'Windrose endpoints resolve on Google DNS but NOT on your system DNS.'
-        Write-Line 'Your ISP or router is filtering these domains.'
+        Write-Line '*** ISP / NETWORK BLOCKING DETECTED ***'
         Write-Line ''
-        if ($detectedCulprit) {
-            Write-Line "*** YOUR FIX: $($detectedCulprit.Name) ***"
-            Write-Line "  Toggle OFF: $($detectedCulprit.Feature)"
-            Write-Line "  Where:      $($detectedCulprit.Toggle)"
-            if ($detectedCulprit.KnownBlocksWindrose) { Write-Line '  Confirmed to fix this on this ISP. Do this FIRST.' }
-            Write-Line ''
-            Write-Line 'If that does not work:'
-        }
-        Write-Line '  1. Switch to Google DNS (8.8.8.8 / 8.8.4.4) - see fix above'
-        Write-Line '  2. Try a VPN - if it works on VPN, confirmed ISP block'
-        Write-Line '  3. Ask your ISP to whitelist *.windrose.support and port 3478 UDP/TCP'
-        $details = if ($detectedCulprit) { "ISP blocking. Fix: toggle off $($detectedCulprit.Feature) on $($detectedCulprit.Name)." } else { "ISP blocking on $($dnsIssues.Count) endpoint(s). Check ISP app security toggle." }
-        Add-Finding -Status 'FAIL' -Check 'Fleet: Overall' -Details $details
+        Write-Line 'Your ISP or router is preventing your system from resolving Windrose'
+        Write-Line 'endpoints. Google DNS can resolve them fine, but your system DNS cannot.'
+        Write-Line 'The devs have publicly acknowledged that some ISPs are blocking their'
+        Write-Line 'backend (particularly in EU and NA).'
+        Write-Line ''
 
+        if ($detectedCulprit) {
+            Write-Line ('*** THIS IS ALMOST CERTAINLY YOUR FIX: {0} ***' -f $detectedCulprit.Name)
+            Write-Line ''
+            Write-Line ('  Toggle OFF: {0}' -f $detectedCulprit.Feature)
+            Write-Line ('  Where:      {0}' -f $detectedCulprit.Toggle)
+            Write-Line ''
+            if ($detectedCulprit.KnownBlocksWindrose) {
+                Write-Line '  This has been confirmed to fix the exact same problem for other'
+                Write-Line '  players on this ISP. Try this FIRST before anything else.'
+            } else {
+                Write-Line '  Other players on this ISP have fixed similar game connectivity'
+                Write-Line '  issues (Rust, Palworld, Ark) by toggling this feature off.'
+            }
+            Write-Line ''
+            Write-Line 'If that does not fix it, or if you cannot find the toggle:'
+        } else {
+            Write-Line 'Your ISP was not in our auto-detect list, so we could not give you a'
+            Write-Line 'specific recommendation. But the general fix below still applies.'
+            Write-Line ''
+        }
+
+        Write-Line '  Alternate fixes:'
+        Write-Line ''
+        Write-Line '  1. Switch to Google DNS (8.8.8.8 / 8.8.4.4) - see instructions below'
+        Write-Line ''
+        Write-Line '  2. Try a VPN - if it works with a VPN, confirmed ISP block'
+        Write-Line ''
+        Write-Line '  3. Contact your ISP and ask them to whitelist:'
+        Write-Line '       Domain:    *.windrose.support (all subdomains)'
+        Write-Line '       Port:      3478'
+        Write-Line '       Protocols: UDP and TCP'
+        Write-Line '       Reason:    STUN/TURN for a legitimate game application'
+        Write-Line ''
+        Write-Line '  How to switch to Google DNS:'
+        Write-Line '    1. Settings > Network & Internet > your active connection > Properties'
+        Write-Line '    2. Edit DNS server assignment > Manual > IPv4 ON'
+        Write-Line '       Preferred: 8.8.8.8   Alternate: 8.8.4.4'
+        Write-Line '    3. Save, then run: ipconfig /flushdns'
+        $details = if ($detectedCulprit) {
+            "ISP blocking detected. Recommended fix: toggle off $($detectedCulprit.Feature) on $($detectedCulprit.Name)."
+        } else {
+            "ISP blocking detected on $($dnsIssues.Count) endpoint(s). Check ISP app for a security toggle."
+        }
+        Add-Finding -Status 'FAIL' -Check 'Fleet: Overall' -Details $details
     } elseif ($anyIpv6Issue) {
         Write-Line '*** IPv6 PRIORITIZATION ISSUE ***'
-        Write-Line 'Your system prefers IPv6 for Windrose domains. Windrose is IPv4-only.'
         Write-Line ''
-        Write-Line 'FIX: Force Windows to prefer IPv4 (keep IPv6 enabled).'
-        Write-Line 'Run this in an elevated Command Prompt:'
-        Write-Line '  reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters" /v DisabledComponents /t REG_DWORD /d 32 /f'
-        Write-Line 'Then restart your PC. To revert: set /d 0 instead.'
-        Add-Finding -Status 'FAIL' -Check 'Fleet: Overall' -Details 'IPv6 prioritization. Game is IPv4-only.'
-
+        Write-Line 'Your system prefers IPv6 for Windrose domains, but the game is IPv4-only.'
+        Write-Line 'This causes silent connection failures.'
+        Write-Line ''
+        Write-Line 'FIX: Keep IPv6 enabled but force Windows to prefer IPv4. Open an elevated'
+        Write-Line 'Command Prompt and run:'
+        Write-Line ''
+        Write-Line '  reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters"'
+        Write-Line '    /v DisabledComponents /t REG_DWORD /d 32 /f'
+        Write-Line ''
+        Write-Line 'Then restart the PC. To revert later, set /d 0 instead of /d 32.'
+        Add-Finding -Status 'FAIL' -Check 'Fleet: Overall' -Details "IPv6 prioritization issue. Game is IPv4-only. See Fleet check section for fix."
     } elseif ($reachable -gt 0 -and $unreachable -gt 0) {
-        Write-Line "PARTIAL: $reachable/$($reachable + $unreachable) endpoints reachable."
+        Write-Line 'PARTIAL REACHABILITY: Some Windrose services are reachable, others are not.'
         Write-Line ''
+
         if ($detectedCulprit) {
-            Write-Line "LIKELY CAUSE: $($detectedCulprit.Name) - $($detectedCulprit.Feature)"
-            Write-Line "  Toggle OFF: $($detectedCulprit.Toggle)"
+            Write-Line ('*** LIKELY CAUSE (based on your ISP): {0} ***' -f $detectedCulprit.Name)
+            Write-Line ''
+            Write-Line ('  Toggle OFF: {0}' -f $detectedCulprit.Feature)
+            Write-Line ('  Where:      {0}' -f $detectedCulprit.Toggle)
+            Write-Line ''
+            if ($detectedCulprit.KnownBlocksWindrose) {
+                Write-Line '  Other players on this same ISP have fixed this exact issue by'
+                Write-Line '  toggling this feature off. Try this FIRST.'
+            } else {
+                Write-Line '  This ISP ships a router security feature that is known to block'
+                Write-Line '  P2P gaming traffic (Rust, Palworld, Ark). Try toggling it off.'
+            }
+            Write-Line ''
+            Write-Line 'Other possibilities:'
+        } else {
+            Write-Line 'Common causes:'
+            Write-Line ''
+            Write-Line '  1. **ISP router security feature blocking specific ports or domains.**'
+            Write-Line '     This is the #1 cause of port 3478 blocks on US cable ISPs. Check:'
+            Write-Line '       - Spectrum:  My Spectrum app > Internet > Security Shield (turn OFF)'
+            Write-Line '       - Xfinity:   Xfinity app > Advanced Security (turn OFF)'
+            Write-Line '       - Cox:       Cox panel > Security Suite (disable)'
+            Write-Line '       - Others:    Look for "Security", "Threat Protection", "Safe Browsing"'
+            Write-Line '                    in your ISP''s app or router admin page.'
             Write-Line ''
         }
-        Write-Line 'Other possibilities:'
-        Write-Line '  - A regional backend is genuinely down (check playwindrose.com / Discord #status)'
-        Write-Line '  - Windows Firewall blocking outbound on specific ports'
+
+        Write-Line '  * A specific regional backend is genuinely down on the dev side.'
+        Write-Line '    Check playwindrose.com or the #status channel in the Windrose Discord.'
         Write-Line ''
-        Write-Line 'If port 3478 is failing: that is P2P signaling. The game cannot connect'
-        Write-Line 'peers without it. Almost always an ISP security feature.'
+        Write-Line '  * Windows Firewall blocking outbound on specific ports. Try temporarily'
+        Write-Line '    disabling the firewall to test (re-enable after).'
+        Write-Line ''
+        Write-Line 'If TCP 3478 is the one failing, that is P2P signaling - the game literally'
+        Write-Line 'cannot connect peers without it. This is almost always an ISP security feature.'
+        Write-Line ''
+        Write-Line 'Dedicated-server hosts (SurvivalServers, LOW.MS, g-portal) do NOT have this'
+        Write-Line 'problem because they run on business connections without consumer filters.'
+        Write-Line 'The block is on your residential ISP side, not Windrose''s or the host''s.'
+        Write-Line ''
         Write-DirectIpFallback
-        $details = if ($detectedCulprit) { "Partial: $reachable ok / $unreachable failed. Likely $($detectedCulprit.Feature) on $($detectedCulprit.Name)." } else { "Partial: $reachable ok / $unreachable failed. Check ISP security toggle." }
+
+        $details = if ($detectedCulprit) {
+            "Partial outage: $reachable reachable, $unreachable unreachable. Recommended fix: toggle off $($detectedCulprit.Feature) on $($detectedCulprit.Name)."
+        } else {
+            "Partial outage: $reachable reachable, $unreachable unreachable. Likely ISP router security (Spectrum Security Shield etc.) or a regional backend issue."
+        }
         Add-Finding -Status 'WARN' -Check 'Fleet: Overall' -Details $details
-
-    } elseif ($unreachable -eq 0) {
-        Write-Ok "All $reachable endpoints reachable. Backend is up on your end."
-        Add-Finding -Status 'PASS' -Check 'Fleet: Overall' -Details "All $reachable Windrose services reachable."
-
     } else {
-        Write-Line 'ALL endpoints unreachable.'
-        Write-Line '  - Backend may be entirely down (check playwindrose.com / Discord #status)'
-        Write-Line '  - Or firewall is blocking ALL outbound HTTPS on port 443'
+        Write-Line 'All Windrose endpoints are unreachable. This can indicate:'
+        Write-Line '  - The Windrose backend is entirely down (dev-side)'
+        Write-Line '  - Your internet connection is broken (but other sites would also fail)'
+        Write-Line '  - Your firewall is blocking ALL outbound HTTPS on port 443'
+        Write-Line ''
+        Write-Line 'Check playwindrose.com and the official Discord for outage announcements.'
+        Write-Line ''
         Write-DirectIpFallback
-        Add-Finding -Status 'FAIL' -Check 'Fleet: Overall' -Details "All $($script:WindroseServiceEndpoints.Count) services unreachable."
+        Add-Finding -Status 'FAIL' -Check 'Fleet: Overall' -Details "All $($script:WindroseServiceEndpoints.Count) Windrose services unreachable."
     }
 
-    if ($reachable -lt $script:WindroseServiceEndpoints.Count) { Show-KnownIspTable }
+    # If there was ANY problem, print the full reference table of known-culprit
+    # ISPs so users / helpers can do a manual visual match.
+    if ($reachable -lt $script:WindroseServiceEndpoints.Count) {
+        Show-KnownIspTable
+    }
 }
 
 # -------------------------------------------------------------------------------
-# Game install detection
+# Hold inventory / watch posts / crew
 # -------------------------------------------------------------------------------
 
 function Get-SteamInstallPath {
-    foreach ($reg in @('HKLM:\SOFTWARE\WOW6432Node\Valve\Steam','HKLM:\SOFTWARE\Valve\Steam','HKCU:\SOFTWARE\Valve\Steam')) {
+    # Steam's install path from the registry is the most reliable starting point.
+    $regPaths = @(
+        'HKLM:\SOFTWARE\WOW6432Node\Valve\Steam',
+        'HKLM:\SOFTWARE\Valve\Steam',
+        'HKCU:\SOFTWARE\Valve\Steam'
+    )
+    foreach ($reg in $regPaths) {
         try {
-            $p = (Get-ItemProperty -Path $reg -ErrorAction Stop).InstallPath
+            $p = (Get-ItemProperty -Path $reg -Name 'InstallPath' -ErrorAction Stop).InstallPath
             if ($p -and (Test-Path $p)) { return $p }
-            $p = (Get-ItemProperty -Path $reg -ErrorAction Stop).SteamPath
-            if ($p -and (Test-Path $p)) { return ($p -replace '/', '\') }
+            $p = (Get-ItemProperty -Path $reg -Name 'SteamPath' -ErrorAction Stop).SteamPath
+            if ($p -and (Test-Path $p)) { return $p -replace '/', '\' }
         } catch { continue }
     }
     return $null
 }
 
+function Get-WindrosePaths {
+    $paths = @()
+    $common = @(
+        'C:\Steam\steamapps\common\Windrose',
+        'C:\Program Files (x86)\Steam\steamapps\common\Windrose',
+        "$env:ProgramFiles(x86)\Steam\steamapps\common\Windrose",
+        "$env:ProgramFiles\Steam\steamapps\common\Windrose"
+    )
+    foreach ($p in $common) {
+        if ($p -and (Test-Path $p)) { $paths += $p }
+    }
+    return $paths | Select-Object -Unique
+}
+
 function Get-SteamLibraries {
     $libs = New-Object System.Collections.Generic.List[string]
-    $root = Get-SteamInstallPath
-    if ($root) { [void]$libs.Add($root) }
 
-    $vdfs = @(
-        "$env:ProgramFiles(x86)\Steam\steamapps\libraryfolders.vdf"
-        "$env:ProgramFiles\Steam\steamapps\libraryfolders.vdf"
-        'C:\Steam\steamapps\libraryfolders.vdf'
-    )
-    if ($root) { $vdfs += (Join-Path $root 'steamapps\libraryfolders.vdf') }
+    # Build list of libraryfolders.vdf candidates - registry path plus legacy defaults
+    $vdfCandidates = New-Object System.Collections.Generic.List[string]
+    [void]$vdfCandidates.Add("$env:ProgramFiles(x86)\Steam\steamapps\libraryfolders.vdf")
+    [void]$vdfCandidates.Add("$env:ProgramFiles\Steam\steamapps\libraryfolders.vdf")
+    [void]$vdfCandidates.Add("C:\Steam\steamapps\libraryfolders.vdf")
 
-    foreach ($vdf in ($vdfs | Select-Object -Unique)) {
+    $steamRoot = Get-SteamInstallPath
+    if ($steamRoot) {
+        [void]$vdfCandidates.Add((Join-Path $steamRoot 'steamapps\libraryfolders.vdf'))
+        [void]$libs.Add($steamRoot)
+    }
+
+    foreach ($vdf in ($vdfCandidates | Select-Object -Unique)) {
         if (Test-Path $vdf) {
             try {
-                [regex]::Matches((Get-Content $vdf -Raw), '"path"\s+"([^"]+)"') | ForEach-Object {
-                    [void]$libs.Add(($_.Groups[1].Value -replace '\\\\', '\'))
+                $content = Get-Content $vdf -Raw -ErrorAction Stop
+                $ms = [regex]::Matches($content, '"path"\s+"([^"]+)"')
+                foreach ($m in $ms) {
+                    [void]$libs.Add(($m.Groups[1].Value -replace '\\\\', '\'))
                 }
             } catch { }
         }
     }
+
+    # Brute-force scan fixed drives for common Steam library folder names.
+    # Catches the case where Steam's own config doesn't list the library
+    # (e.g. manually created libraries).
     try {
-        Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Free -gt 0 -and $_.Root -match '^[A-Z]:\\$' } | ForEach-Object {
-            foreach ($n in @('SteamLibrary','Steam','Games\SteamLibrary','Games\Steam')) {
-                $c = Join-Path $_.Root $n
+        $drives = Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue |
+            Where-Object { $_.Free -gt 0 -and $_.Root -match '^[A-Z]:\\$' }
+        foreach ($d in $drives) {
+            $driveCandidates = @(
+                (Join-Path $d.Root 'SteamLibrary')
+                (Join-Path $d.Root 'Steam')
+                (Join-Path $d.Root 'Games\SteamLibrary')
+                (Join-Path $d.Root 'Games\Steam')
+            )
+            foreach ($c in $driveCandidates) {
                 if (Test-Path $c) { [void]$libs.Add($c) }
             }
         }
     } catch { }
+
     return ($libs | Select-Object -Unique)
 }
 
+$script:WindroseInstallCache = $null
+
 function Find-WindroseInstall {
-    if ($null -ne $script:WindroseInstallCache) { return ,@($script:WindroseInstallCache) }
+    # Cache the result - this function is called twice (once by Test-Seaworthy,
+    # once by Get-GameVersionInfo) and they should always agree.
+    if ($null -ne $script:WindroseInstallCache) {
+        return ,@($script:WindroseInstallCache)  # comma operator forces array wrap
+    }
+
     $candidates = New-Object System.Collections.Generic.List[string]
-    $add = {
+
+    # Helper: add a path to the list, normalizing it first. Skips empty/bogus entries.
+    $addPath = {
         param($p)
         if ([string]::IsNullOrWhiteSpace($p)) { return }
         try {
-            $n = try { (Resolve-Path -LiteralPath $p -ErrorAction Stop).Path } catch { $p.ToString().TrimEnd('\').Trim() }
-            if ($n -and $n -match ':\\') { $candidates.Add($n) }
+            # Force to a clean string. Resolve-Path gives a canonical form but fails
+            # on non-existent paths, so fall back to trimming.
+            $normalized = $null
+            try {
+                $normalized = (Resolve-Path -LiteralPath $p -ErrorAction Stop).Path
+            } catch {
+                $normalized = $p.ToString().TrimEnd('\').Trim()
+            }
+            if (-not [string]::IsNullOrWhiteSpace($normalized) -and $normalized -match ':\\') {
+                $candidates.Add($normalized)
+            }
         } catch { }
     }
-    foreach ($lib in (Get-SteamLibraries)) {
-        foreach ($sub in @('steamapps\common\Windrose','common\Windrose')) {
-            $c = Join-Path $lib $sub
-            if (Test-Path $c) { & $add $c }
-        }
+
+    foreach ($p in (Get-WindrosePaths)) {
+        & $addPath $p
     }
+
+    foreach ($lib in (Get-SteamLibraries)) {
+        $c1 = Join-Path $lib 'steamapps\common\Windrose'
+        $c2 = Join-Path $lib 'common\Windrose'
+        if (Test-Path $c1) { & $addPath $c1 }
+        if (Test-Path $c2) { & $addPath $c2 }
+    }
+
+    # Last resort: scan firewall rules for an already-known Windrose.exe path.
     try {
-        $fp = Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue |
-            Where-Object { $_.Program -match '\\Windrose\\.*Windrose\.exe$|\\Windrose\\.*R5.*\.exe$' } |
+        $firewallPath = Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue |
+            Where-Object { $_.Program -match '\\Windrose\\.*Windrose\.exe$' -or $_.Program -match '\\Windrose\\.*R5.*\.exe$' } |
             Select-Object -ExpandProperty Program -First 1
-        if ($fp) {
-            $d = Split-Path $fp -Parent
-            while ($d -and (Split-Path $d -Leaf) -ne 'Windrose') {
-                $p = Split-Path $d -Parent; if ($p -eq $d) { $d = $null; break }; $d = $p
+        if ($firewallPath) {
+            # Walk up to the Windrose folder
+            $installDir = Split-Path $firewallPath -Parent
+            while ($installDir -and (Split-Path $installDir -Leaf) -ne 'Windrose') {
+                $parent = Split-Path $installDir -Parent
+                if ($parent -eq $installDir) { $installDir = $null; break }
+                $installDir = $parent
             }
-            if ($d -and (Test-Path $d)) { & $add $d }
+            if ($installDir -and (Test-Path $installDir)) {
+                & $addPath $installDir
+            }
         }
     } catch { }
-    $seen   = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+
+    # Case-insensitive dedupe (Windows paths aren't case-sensitive)
+    $seen = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
     $unique = New-Object System.Collections.Generic.List[string]
-    foreach ($c in $candidates) { if ($seen.Add($c)) { $unique.Add($c) } }
+    foreach ($c in $candidates) {
+        if ($seen.Add($c)) { $unique.Add($c) }
+    }
+
+    # Return as a plain string array, force single-item arrays to stay arrays
     $result = @($unique.ToArray())
     $script:WindroseInstallCache = $result
     return $result
 }
 
-function Find-DedicatedServerInstall {
-    $candidates = New-Object System.Collections.Generic.List[string]
-    foreach ($install in @(Find-WindroseInstall)) {
-        foreach ($sub in @('R5\Builds\WindroseServer','R5\Builds\WindowsServer')) {
-            $p = Join-Path $install $sub
-            if (Test-Path $p) { $candidates.Add($p) }
+function Copy-IfExists {
+    param([string]$Source, [string]$Destination)
+    if (Test-Path $Source) {
+        $destDir = Split-Path $Destination -Parent
+        if (-not (Test-Path $destDir)) {
+            New-Item -ItemType Directory -Path $destDir -Force | Out-Null
         }
+        Copy-Item -Path $Source -Destination $Destination -Force -Recurse
+        return $true
     }
-    foreach ($lib in (Get-SteamLibraries)) {
-        $p = Join-Path $lib 'steamapps\common\Windrose Dedicated Server'
-        if (Test-Path $p) { $candidates.Add($p) }
-    }
-    foreach ($p in @('C:\WindroseServer','C:\Game_Servers\Windrose_Server',"$env:USERPROFILE\WindroseServer")) {
-        if (Test-Path $p) { $candidates.Add($p) }
-    }
-    return ($candidates | Select-Object -Unique)
+    return $false
 }
 
-# -------------------------------------------------------------------------------
-# Diagnostic sections
-# -------------------------------------------------------------------------------
+function Check-SaveHealth {
+    # Inspects a RocksDB-backed SaveProfiles directory for structural issues.
+    # Called from Collect-GameFiles for each detected save slot.
+    # Surfaces findings that help diagnose Nitrado-to-self-hosted migration crashes.
+    param([string]$SaveProfilesPath)
 
-function Get-LocalNetworkSummary {
-    Write-Section 'Local network'
-    foreach ($p in (Get-NetConnectionProfile)) {
-        Write-Line "  $($p.Name) | $($p.NetworkCategory) | IPv4: $($p.IPv4Connectivity) | IPv6: $($p.IPv6Connectivity)"
-        if ($p.NetworkCategory -eq 'Public') {
-            Add-Finding -Status 'WARN' -Check 'Network profile' -Details "'$($p.Name)' is Public - firewall may be stricter."
+    if (-not (Test-Path $SaveProfilesPath)) { return }
+
+    Write-Section 'Save hold inspection (RocksDB health)'
+
+    $slots = Get-ChildItem -Path $SaveProfilesPath -Directory -ErrorAction SilentlyContinue
+    if (-not $slots -or $slots.Count -eq 0) {
+        Write-Line 'No save slots found under SaveProfiles.'
+        Add-Finding -Status 'INFO' -Check 'Save Health' -Details 'SaveProfiles directory exists but contains no save slots.'
+        return
+    }
+
+    Write-Line ("Found {0} save slot(s):" -f $slots.Count)
+
+    foreach ($slot in $slots) {
+        $slotName = $slot.Name
+        Write-Line ''
+        Write-Line "  Slot: $slotName"
+
+        # --- LOCK file check ---
+        # RocksDB writes a LOCK file on open and removes it on clean shutdown.
+        # Migrated saves from Nitrado (or any external host) almost always carry
+        # a stale LOCK because the source server never did a clean shutdown cycle
+        # in the target environment. Wine/Docker sees this as the DB already being
+        # open and crashes immediately on startup.
+        $lockFile = Join-Path $slot.FullName 'LOCK'
+        if (Test-Path $lockFile) {
+            $lockInfo = Get-Item $lockFile -ErrorAction SilentlyContinue
+            $lockAge  = if ($lockInfo) { [math]::Round(((Get-Date) - $lockInfo.LastWriteTime).TotalHours, 1) } else { '?' }
+            Write-Line "    [WARN] Stale LOCK file detected (last written ~$lockAge hours ago)."
+            Write-Line '           This will cause crash-on-startup when migrating saves to a new host.'
+            Write-Line '           Fix: delete the LOCK file before starting the server.'
+            Write-Line "           Path: $lockFile"
+            Add-Finding -Status 'WARN' -Check "Save Health: $slotName" -Details "Stale RocksDB LOCK file in slot '$slotName'. Delete before migrating to self-hosted/Docker. Path: $lockFile"
+        } else {
+            Write-Line '    [PASS] No LOCK file (clean shutdown or already removed).'
+            Add-Finding -Status 'PASS' -Check "Save Health: $slotName" -Details "No stale LOCK file in slot '$slotName'."
+        }
+
+        # --- MANIFEST / CURRENT file check ---
+        # RocksDB requires a MANIFEST-###### file and a CURRENT pointer to be
+        # present and consistent. A missing or zero-byte CURRENT means the DB
+        # cannot find its own manifest and will refuse to open.
+        $currentFile   = Join-Path $slot.FullName 'CURRENT'
+        $manifestFiles = Get-ChildItem -Path $slot.FullName -Filter 'MANIFEST-*' -ErrorAction SilentlyContinue
+
+        if (-not (Test-Path $currentFile)) {
+            Write-Line '    [FAIL] CURRENT pointer file missing - save is unreadable.'
+            Add-Finding -Status 'FAIL' -Check "Save Health: $slotName" -Details "RocksDB CURRENT file missing in slot '$slotName'. Save data is likely corrupt or incomplete."
+        } else {
+            $currentContent = (Get-Content $currentFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+            if ([string]::IsNullOrWhiteSpace($currentContent)) {
+                Write-Line '    [FAIL] CURRENT file is empty - save is unreadable.'
+                Add-Finding -Status 'FAIL' -Check "Save Health: $slotName" -Details "RocksDB CURRENT file is empty in slot '$slotName'. Save is corrupt."
+            } elseif ($manifestFiles -and ($manifestFiles.Name -notcontains $currentContent.Trim())) {
+                Write-Line "    [WARN] CURRENT points to '$($currentContent.Trim())' but that file was not found."
+                Write-Line '           Save may be corrupt or from a different server version.'
+                Add-Finding -Status 'WARN' -Check "Save Health: $slotName" -Details "CURRENT points to '$($currentContent.Trim())' but manifest file not found in slot '$slotName'. Possible corruption or version mismatch."
+            } else {
+                Write-Line "    [PASS] CURRENT pointer looks valid ($($currentContent.Trim()))."
+                Add-Finding -Status 'PASS' -Check "Save Health: $slotName" -Details "CURRENT pointer valid in slot '$slotName'."
+            }
+        }
+
+        if (-not $manifestFiles) {
+            Write-Line '    [FAIL] No MANIFEST file found - save is unreadable.'
+            Add-Finding -Status 'FAIL' -Check "Save Health: $slotName" -Details "No RocksDB MANIFEST file in slot '$slotName'. Save is corrupt or was never fully written."
+        } else {
+            Write-Line ("    [PASS] MANIFEST file present: {0}" -f ($manifestFiles | Select-Object -First 1).Name)
+        }
+
+        # --- SST file inventory ---
+        # SST files (.sst) are the actual data tables. A healthy save has at least
+        # one. Zero SST files on a slot that has a MANIFEST usually means a partial
+        # transfer (Nitrado zip didn't include the data files).
+        $sstFiles = Get-ChildItem -Path $slot.FullName -Filter '*.sst' -ErrorAction SilentlyContinue
+        if (-not $sstFiles -or $sstFiles.Count -eq 0) {
+            Write-Line '    [WARN] No .sst data files found - save may be empty or transfer was incomplete.'
+            Add-Finding -Status 'WARN' -Check "Save Health: $slotName" -Details "No .sst data files in slot '$slotName'. Save may be empty or the Nitrado export was incomplete (missing data files)."
+        } else {
+            $sstTotalMB = [math]::Round(($sstFiles | Measure-Object -Property Length -Sum).Sum / 1MB, 2)
+            Write-Line ("    [PASS] {0} .sst file(s), {1} MB total data." -f $sstFiles.Count, $sstTotalMB)
+            Add-Finding -Status 'PASS' -Check "Save Health: $slotName" -Details "$($sstFiles.Count) .sst files, $sstTotalMB MB in slot '$slotName'."
+        }
+
+        # --- WAL file note ---
+        # Write-ahead log (.log) files hold uncommitted transactions. If a server
+        # crashed mid-write the WAL may contain partial data. Not a hard failure
+        # but worth surfacing so helpers know replay will happen on next open.
+        $walFiles = Get-ChildItem -Path $slot.FullName -Filter '*.log' -ErrorAction SilentlyContinue
+        if ($walFiles -and $walFiles.Count -gt 0) {
+            $walTotalKB = [math]::Round(($walFiles | Measure-Object -Property Length -Sum).Sum / 1KB, 1)
+            Write-Line ("    [INFO] {0} WAL file(s) present ({1} KB). RocksDB will replay these on next open." -f $walFiles.Count, $walTotalKB)
+            Add-Finding -Status 'INFO' -Check "Save Health: $slotName" -Details "$($walFiles.Count) WAL (.log) file(s) in slot '$slotName' ($walTotalKB KB). Normal after unclean shutdown; RocksDB replays on next open."
         }
     }
-    Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
-        Write-Line "  UP: $($_.Name) | $($_.InterfaceDescription) | $($_.LinkSpeed)"
-    }
-}
 
-function Check-SteamAndProcesses {
-    Write-Section 'Running processes'
-    $procs = Get-Process | Where-Object { $_.ProcessName -match 'steam|Windrose|R5' } |
-        Select-Object ProcessName, Id, StartTime, Path
-    if ($procs) {
-        foreach ($pr in $procs) { Write-Line ($pr | Format-List | Out-String).TrimEnd() }
-        Add-Finding -Status 'PASS' -Check 'Processes' -Details 'Steam and/or Windrose processes running.'
-    } else {
-        Write-Line '  No Steam or Windrose processes running.'
-        Add-Finding -Status 'INFO' -Check 'Processes' -Details 'Steam and Windrose not currently running.'
-    }
+    Write-Line ''
+    Write-Line 'Save hold inspection complete.'
+    Write-Line 'If migrating from Nitrado to self-hosted/Docker: the most common crash cause'
+    Write-Line 'is a stale LOCK file in the save slot. Delete it before starting the server.'
+    Write-Line 'Fresh worlds work because they never carry a LOCK from a different environment.'
 }
 
 function Get-GameVersionInfo {
     $installs = @(Find-WindroseInstall)
-    Write-Section 'Game install'
+    Write-Section 'Shipyard (Windrose installs)'
     if (-not $installs -or $installs.Count -eq 0) {
-        Write-Warn 'No Windrose install detected.'
+        Write-Line 'No install path auto-detected.'
         Add-Finding -Status 'WARN' -Check 'Game install' -Details 'Windrose install not auto-detected.'
         return @()
     }
+
+    foreach ($i in $installs) { Write-Line ([string]$i) }
+
     foreach ($install in $installs) {
-        Write-Line "  Install: $install"
-        Get-ChildItem -Path $install -Recurse -Include *.exe -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match 'Windrose|R5' } | Select-Object -First 5 |
-            ForEach-Object { Write-Line "    $($_.FullName) | v$($_.VersionInfo.FileVersion)" }
-        Add-Finding -Status 'PASS' -Check 'Game install' -Details "Detected at $install."
+        $installStr = [string]$install
+        $exeCandidates = Get-ChildItem -Path $installStr -Recurse -Include *.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'Windrose|R5' } |
+            Select-Object -First 5
+
+        if ($exeCandidates) {
+            Write-Section "Hull markings in $installStr"
+            foreach ($exe in $exeCandidates) {
+                Write-Line ("{0} | {1}" -f $exe.FullName, $exe.VersionInfo.FileVersion)
+            }
+            Add-Finding -Status 'PASS' -Check 'Game install' -Details "Install and version info detected in $installStr."
+        } else {
+            Add-Finding -Status 'WARN' -Check 'Game version' -Details "Install found at $installStr but no Windrose/R5 exe detected."
+        }
     }
+
     return $installs
 }
 
 function Collect-GameFiles {
     param([string[]]$Installs)
     if (-not $Installs) { return }
+
     foreach ($install in $Installs) {
-        $dest = Join-Path $script:LogsOut ($install -replace '[:\\/ ]', '_')
-        New-Item -ItemType Directory -Path $dest -Force | Out-Null
+        $safeName = ($install -replace '[:\\/ ]', '_')
+        $destBase = Join-Path $script:LogsOut $safeName
+        New-Item -ItemType Directory -Path $destBase -Force | Out-Null
+
+        $savedPath    = Join-Path $install 'R5\Saved'
+        $saveProfiles = Join-Path $savedPath 'SaveProfiles'
+        $configPath   = Join-Path $savedPath 'Config'
+
         Write-Section "Salvage from $install"
-        $savedPath = Join-Path $install 'R5\Saved'
-        foreach ($sub in @('SaveProfiles','Config')) {
-            $src = Join-Path $savedPath $sub
-            if (Test-Path $src) { Copy-Item $src (Join-Path $dest $sub) -Recurse -Force; Write-Line "  Recovered $sub" }
+
+        if (Copy-IfExists -Source $saveProfiles -Destination (Join-Path $destBase 'SaveProfiles')) {
+            Write-Line 'Recovered SaveProfiles'
+        } else {
+            Write-Line 'SaveProfiles not found'
         }
-        Get-ChildItem -Path $install -Recurse -Filter 'ServerDescription.json' -ErrorAction SilentlyContinue | Select-Object -First 3 |
-            ForEach-Object {
-                Copy-Item $_.FullName (Join-Path $dest "ServerDescription_$($_.Name)") -Force
-                Write-Line "  Recovered $($_.FullName)"
+
+        Check-SaveHealth -SaveProfilesPath $saveProfiles
+
+        if (Copy-IfExists -Source $configPath -Destination (Join-Path $destBase 'Config')) {
+            Write-Line 'Recovered Config'
+        } else {
+            Write-Line 'Config not found'
+        }
+
+        $serverDesc = Get-ChildItem -Path $install -Recurse -Filter 'ServerDescription.json' -ErrorAction SilentlyContinue | Select-Object -First 3
+        if ($serverDesc) {
+            foreach ($f in $serverDesc) {
+                $dest = Join-Path $destBase ("ServerDescription_" + $f.Name)
+                Copy-Item $f.FullName $dest -Force
+                Write-Line "Recovered $($f.FullName)"
             }
-        $logs = Get-ChildItem -Path $savedPath -Recurse -Include *.log,*.txt -ErrorAction SilentlyContinue | Select-Object -First 50
-        if ($logs) {
-            $ld = Join-Path $dest 'Logs'; New-Item -ItemType Directory -Path $ld -Force | Out-Null
-            $logs | ForEach-Object { Copy-Item $_.FullName (Join-Path $ld $_.Name) -Force }
-            Write-Line "  Recovered $($logs.Count) log/text files"
+        } else {
+            Write-Line 'ServerDescription.json not found'
+        }
+
+        $logFiles = Get-ChildItem -Path $savedPath -Recurse -Include *.log,*.txt -ErrorAction SilentlyContinue
+        if ($logFiles) {
+            $logsFolder = Join-Path $destBase 'Logs'
+            New-Item -ItemType Directory -Path $logsFolder -Force | Out-Null
+            foreach ($log in $logFiles | Select-Object -First 50) {
+                Copy-Item $log.FullName (Join-Path $logsFolder $log.Name) -Force
+            }
+            Write-Line "Recovered $($logFiles.Count) log/text files (up to 50)"
+        } else {
+            Write-Line 'No log files found under Saved'
         }
     }
 }
 
 function Check-LocalFirewallRules {
-    Write-Section 'Firewall'
+    Write-Section 'Watch posts (firewall profiles)'
     foreach ($p in (Get-NetFirewallProfile)) {
-        Write-Line "  $($p.Name): Enabled=$($p.Enabled) Inbound=$($p.DefaultInboundAction) Outbound=$($p.DefaultOutboundAction)"
+        Write-Line ("{0}: Enabled={1} Inbound={2} Outbound={3}" -f $p.Name, $p.Enabled, $p.DefaultInboundAction, $p.DefaultOutboundAction)
     }
-    $rules = Get-NetFirewallApplicationFilter | Where-Object { $_.Program -match 'Steam|Windrose|R5' } | Select-Object -First 20
+
+    $rules = Get-NetFirewallApplicationFilter |
+        Where-Object { $_.Program -match 'Steam|Windrose|R5' } |
+        Select-Object -First 20
+
+    Write-Section 'Passwords at the gate (Steam/Windrose firewall rules)'
     if ($rules) {
-        Write-Line '  Steam/Windrose filters found:'
-        foreach ($r in $rules) { Write-Line "    $($r.Program)" }
-        Add-Finding -Status 'PASS' -Check 'Firewall' -Details 'Steam/Windrose firewall filters found.'
+        foreach ($r in $rules) { Write-Line ($r | Out-String).TrimEnd() }
+        Add-Finding -Status 'PASS' -Check 'Firewall app rules' -Details 'Found Steam or Windrose firewall filters.'
     } else {
-        Write-Warn 'No Steam/Windrose application filters found.'
-        Add-Finding -Status 'WARN' -Check 'Firewall' -Details 'No Steam/Windrose application filters detected.'
+        Write-Line 'No matching Steam/Windrose application filters were found.'
+        Add-Finding -Status 'WARN' -Check 'Firewall app rules' -Details 'No Steam/Windrose firewall filters found.'
+    }
+}
+
+function Check-SteamAndProcesses {
+    Write-Section 'Crew roster (running processes)'
+    $procs = Get-Process |
+        Where-Object { $_.ProcessName -match 'steam|Windrose|R5' } |
+        Select-Object ProcessName, Id, StartTime, Path
+    if ($procs) {
+        foreach ($pr in $procs) { Write-Line ($pr | Format-List | Out-String).TrimEnd() }
+        Add-Finding -Status 'PASS' -Check 'Processes' -Details 'Steam and/or Windrose processes detected.'
+    } else {
+        Write-Line 'No Steam or Windrose processes are currently running.'
+        Add-Finding -Status 'INFO' -Check 'Processes' -Details 'Steam and Windrose not running right now.'
     }
 }
 
 function Check-RecentErrors {
-    Write-Section 'Recent errors'
-    $events = Get-WinEvent -LogName Application -MaxEvents 250 -ErrorAction SilentlyContinue |
+    Write-Section 'Man overboard (recent errors)'
+    $events = Get-WinEvent -LogName Application -MaxEvents 250 |
         Where-Object {
             $_.LevelDisplayName -in @('Error','Critical') -and (
                 $_.ProviderName -match 'Application Error|Windows Error Reporting|Steam|Windrose' -or
-                $_.Message      -match 'Windrose|R5|steam'
+                $_.Message -match 'Windrose|R5|steam'
             )
-        } | Select-Object -First 25 TimeCreated, ProviderName, Id, LevelDisplayName, Message
+        } |
+        Select-Object -First 25 TimeCreated, ProviderName, Id, LevelDisplayName, Message
+
     if ($events) {
         foreach ($e in $events) { Write-Line ($e | Format-List | Out-String).TrimEnd() }
-        Add-Finding -Status 'WARN' -Check 'Recent errors' -Details 'Related application errors in event log - review report.'
+        Add-Finding -Status 'WARN' -Check 'Recent crashes/errors' -Details 'Recent related application errors found - review report.'
     } else {
-        Write-Line '  No recent related application errors found.'
-        Add-Finding -Status 'PASS' -Check 'Recent errors' -Details 'No recent related errors.'
+        Write-Line 'No recent related application errors found in sampled log.'
+        Add-Finding -Status 'PASS' -Check 'Recent crashes/errors' -Details 'No recent related application errors found.'
     }
 }
 
-function Check-HostsFile {
-    Run-CommandCapture -Label 'Hosts file' -Command { Get-Content "$env:WINDIR\System32\drivers\etc\hosts" }
-}
-
-# -------------------------------------------------------------------------------
-# Mode 2 - server reachability
-# -------------------------------------------------------------------------------
-
-function Test-ServerReachability {
-    param([string]$Target, [int]$Port)
-
-    Write-Section "DNS: $Target"
-    try {
-        $r   = Resolve-DnsName -Name $Target -ErrorAction Stop
-        $ips = $r | Where-Object { $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique
-        if ($ips) {
-            foreach ($ip in $ips) { Write-Line "  $Target -> $ip" }
-            Add-Finding -Status 'PASS' -Check 'DNS' -Details "Resolved $Target."
-        } else {
-            Write-Fail 'No addresses returned.'
-            Add-Finding -Status 'WARN' -Check 'DNS' -Details "No addresses for $Target."
-        }
-    } catch {
-        Write-Fail "DNS failed: $($_.Exception.Message)"
-        Add-Finding -Status 'FAIL' -Check 'DNS' -Details "DNS failed for $Target."
-    }
-
-    Write-Section "Ping: $Target"
-    try {
-        $pings = Test-Connection -TargetName $Target -Count 4 -ErrorAction Stop
-        foreach ($p in $pings) { Write-Line "  Reply $($p.Latency) ms" }
-        $avg = [math]::Round(($pings | Measure-Object -Property Latency -Average).Average, 1)
-        Add-Finding -Status 'PASS' -Check 'Ping' -Details "Average $avg ms."
-    } catch {
-        Write-Warn 'Ping failed or ICMP blocked (not definitive for game connectivity).'
-        Add-Finding -Status 'WARN' -Check 'Ping' -Details 'Ping failed.'
-    }
-
-    Write-Section "TCP port: $Target`:$Port"
-    $r = Test-NetConnection -ComputerName $Target -Port $Port -InformationLevel Detailed -WarningAction SilentlyContinue
-    Write-Line ($r | Out-String).TrimEnd()
-    if ($r.TcpTestSucceeded) {
-        Add-Finding -Status 'PASS' -Check "TCP $Port" -Details "TCP $Port reachable on $Target."
-    } else {
-        Add-Finding -Status 'FAIL' -Check "TCP $Port" -Details "TCP $Port unreachable. If game uses UDP, check host firewall/port forwarding."
-    }
-
-    Write-Section "Port presets: $Target"
-    foreach ($preset in $script:WindrosePortPresets) {
-        $pr    = Test-NetConnection -ComputerName $Target -Port $preset.Port -WarningAction SilentlyContinue
-        $state = if ($pr.TcpTestSucceeded) { 'OPEN (TCP)' } else { 'closed/filtered' }
-        Write-Line ("  {0,-6} {1,-10} {2,-38} -> {3}" -f $preset.Port, $preset.Protocol, $preset.Purpose, $state)
-        Add-Finding -Status (if ($pr.TcpTestSucceeded) { 'PASS' } else { 'WARN' }) `
-            -Check "Port $($preset.Port)" -Details "$($preset.Purpose) -> $state"
-    }
-    Write-Line '  Note: UDP cannot be confirmed client-side. closed/filtered on UDP-only ports is inconclusive.'
-
-    if (-not $SkipTraceRoute) {
-        Run-CommandCapture -Label "Traceroute: $Target" -Command { tracert $Target }
+function Check-VCRuntimes {
+    Run-CommandCapture -Label 'Powder magazine (VC++ runtimes)' -Command {
+        Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue |
+            Get-ItemProperty -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSObject.Properties.Name -contains 'DisplayName' -and $_.DisplayName -and $_.DisplayName -match 'Visual C\+\+' } |
+            Sort-Object DisplayName |
+            Select-Object DisplayName, DisplayVersion, Publisher |
+            Format-Table -Auto
     }
 }
 
 # -------------------------------------------------------------------------------
-# Shipwright - dedicated server setup and save management
-# -------------------------------------------------------------------------------
-
-function Invoke-Shipwright {
-    Write-Host ''
-    Write-Host '==============================' -ForegroundColor Yellow
-    Write-Host '       SHIPWRIGHT             ' -ForegroundColor Yellow
-Write-Host '  Dedicated server toolkit    ' -ForegroundColor Yellow
-    Write-Host '==============================' -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host '  1. Setup server       - copy WindroseServer out of game files and configure it'
-    Write-Host '  2. Transfer save      - move a world between client and dedicated server'
-    Write-Host '  3. Validate config    - check World Island ID triple-match (no file changes)'
-    Write-Host '  4. Exit'
-    Write-Host ''
-    $choice = Read-Host 'Choice (1-4)'
-    switch ($choice) {
-        '1' { Invoke-ServerSetup }
-        '2' { Invoke-SaveTransfer }
-        '3' { Invoke-ValidateServerConfig }
-    }
-}
-
-# --- Server setup ---
-
-function Invoke-ServerSetup {
-    Write-Host ''
-    Write-Host '--- Setup: find and copy server files ---' -ForegroundColor Cyan
-
-    $installs = @(Find-WindroseInstall)
-
-    # Check for already-deployed server installs first
-    $existingServers = @(Find-DedicatedServerInstall | Where-Object { $_ -notmatch '\\R5\\Builds\\' })
-    if ($existingServers.Count -gt 0) {
-        Write-Host ''
-        Write-Host '[OK] Existing dedicated server install(s) found:' -ForegroundColor Green
-        for ($i = 0; $i -lt $existingServers.Count; $i++) {
-            Write-Host "  $($i+1). $($existingServers[$i])"
-        }
-        Write-Host ''
-        Write-Host '  1. Configure one of these'
-        Write-Host '  2. Copy a fresh one from game files'
-        Write-Host '  3. Cancel'
-        $pick = Read-Host 'Choice (1-3)'
-        if ($pick -eq '1') {
-            $idx = 0
-            if ($existingServers.Count -gt 1) {
-                $n = Read-Host "Which? (1-$($existingServers.Count))"
-                $idx = [math]::Max(0, [int]$n - 1)
-            }
-            Invoke-ConfigureServer -ServerPath $existingServers[$idx]
-            return
-        } elseif ($pick -eq '3') { return }
-    }
-
-    # Find server source inside game install
-    $src = $null
-    foreach ($install in $installs) {
-        foreach ($sub in @('R5\Builds\WindroseServer','R5\Builds\WindowsServer')) {
-            $p = Join-Path $install $sub
-            if (Test-Path $p) { $src = $p; break }
-        }
-        if ($src) { break }
-    }
-
-    if (-not $src) {
-        Write-Host '[FAIL] WindroseServer folder not found inside game install.' -ForegroundColor Red
-        Write-Host 'Alternatives:'
-        Write-Host '  - Install "Windrose Dedicated Server" free from Steam (Tools section)'
-        Write-Host '  - Manually copy <GameInstall>\R5\Builds\WindroseServer to anywhere outside the game folder'
-        return
-    }
-
-    Write-Host "[OK] Server source: $src" -ForegroundColor Green
-    Write-Host ''
-    $default = 'C:\WindroseServer'
-    $destIn  = Read-Host "Copy to where? [default: $default]"
-    $dest    = if ([string]::IsNullOrWhiteSpace($destIn)) { $default } else { $destIn.Trim() }
-
-    # Warn if they picked a path inside the game folder
-    foreach ($install in $installs) {
-        if ($dest -like "$install*") {
-            Write-Host ''
-            Write-Host '[WARN] That path is inside the game folder.' -ForegroundColor Yellow
-            Write-Host 'Per the official docs, the game client will shut down the server if launched from there.'
-            $c = Read-Host 'Continue anyway? (y/N)'
-            if ($c -notmatch '^[Yy]') { Write-Host 'Cancelled.'; return }
-        }
-    }
-
-    if (Test-Path $dest) {
-        Write-Host "[WARN] '$dest' already exists." -ForegroundColor Yellow
-        $ow = Read-Host 'Overwrite? (y/N)'
-        if ($ow -notmatch '^[Yy]') { Write-Host 'Cancelled.'; return }
-        Remove-Item $dest -Recurse -Force
-    }
-
-    Write-Host "Copying files to $dest..."
-    try {
-        Copy-Item -Path $src -Destination $dest -Recurse -Force
-        Write-Host '[OK] Files copied.' -ForegroundColor Green
-    } catch {
-        Write-Host "[FAIL] Copy failed: $($_.Exception.Message)" -ForegroundColor Red
-        return
-    }
-
-    Invoke-ConfigureServer -ServerPath $dest
-}
-
-function Invoke-ConfigureServer {
-    param([string]$ServerPath)
-    Write-Host ''
-    Write-Host '--- Configure server ---' -ForegroundColor Cyan
-
-    $descPath = Join-Path $ServerPath $script:ServerDescFile
-    $batFile  = Join-Path $ServerPath 'StartServerForeground.bat'
-    $exeFile  = Join-Path $ServerPath 'WindroseServer.exe'
-
-    # Generate default config if it does not exist yet
-    if (-not (Test-Path $descPath)) {
-        Write-Host 'ServerDescription.json not found - need to run the server once to generate it.'
-        Write-Host ''
-        if (Test-Path $batFile) {
-            Write-Host "Starting: $batFile"
-            Write-Host 'Watch for an invite code in the console window, then close that window.'
-            Start-Process -FilePath $batFile -WorkingDirectory $ServerPath
-            Read-Host 'Press Enter here once you have CLOSED the server window'
-        } elseif (Test-Path $exeFile) {
-            Start-Process -FilePath $exeFile -WorkingDirectory $ServerPath
-            Start-Sleep -Seconds 15
-            Get-Process | Where-Object { $_.Path -eq $exeFile } | Stop-Process -Force
-            Write-Host 'Server run complete.'
-        } else {
-            Write-Host "[FAIL] WindroseServer.exe not found in $ServerPath" -ForegroundColor Red
-            return
-        }
-    }
-
-    if (-not (Test-Path $descPath)) {
-        Write-Host '[FAIL] ServerDescription.json was not generated.' -ForegroundColor Red
-        return
-    }
-
-    try {
-        $desc = Get-Content $descPath -Raw | ConvertFrom-Json
-        $cfg  = $desc.ServerDescription_Persistent
-    } catch {
-        Write-Host "[FAIL] Could not read ServerDescription.json: $($_.Exception.Message)" -ForegroundColor Red
-        return
-    }
-
-    Write-Host ''
-    Write-Host 'Current config:' -ForegroundColor Green
-    Write-Host "  Invite Code:  $($cfg.InviteCode)"
-    Write-Host "  Server Name:  $(if ($cfg.ServerName) { $cfg.ServerName } else { '(not set)' })"
-    Write-Host "  World ID:     $($cfg.WorldIslandId)"
-    Write-Host "  Max Players:  $($cfg.MaxPlayerCount)"
-    Write-Host "  Region:       $(if ($cfg.UserSelectedRegion) { $cfg.UserSelectedRegion } else { 'Auto' })"
-    Write-Host ''
-
-    $edit = Read-Host 'Edit settings now? (Y/n)'
-    if ($edit -match '^[Nn]') {
-        Write-Host ''
-        Write-Host "Ready. Start the server with: $batFile"
-        Write-Host "Crew connect via: Play > Connect to Server > invite code $($cfg.InviteCode)"
-        return
-    }
-
-    $name = Read-Host "Server name [current: $(if ($cfg.ServerName) { $cfg.ServerName } else { '(none)' })]"
-    if (-not [string]::IsNullOrWhiteSpace($name)) { $cfg.ServerName = $name }
-
-    $maxP = Read-Host "Max players [current: $($cfg.MaxPlayerCount)]"
-    if ($maxP -match '^\d+$') { $cfg.MaxPlayerCount = [int]$maxP }
-
-    Write-Host "Region options: EU (covers EU+NA), CIS, SEA, or blank for Auto"
-    $region = Read-Host "Region [current: $(if ($cfg.UserSelectedRegion) { $cfg.UserSelectedRegion } else { 'Auto' })]"
-    if ($region -in @('EU','CIS','SEA')) { $cfg.UserSelectedRegion = $region }
-    elseif ($region -eq '' -or $region -eq 'Auto') { $cfg.UserSelectedRegion = '' }
-    elseif (-not [string]::IsNullOrWhiteSpace($region)) { Write-Host '[WARN] Invalid region - keeping current.' -ForegroundColor Yellow }
-
-    $pw = Read-Host 'Password (leave blank for none / to keep current)'
-    if (-not [string]::IsNullOrWhiteSpace($pw)) {
-        $cfg.Password = $pw; $cfg.IsPasswordProtected = $true
-    } elseif ($cfg.IsPasswordProtected) {
-        $rem = Read-Host 'Remove existing password? (y/N)'
-        if ($rem -match '^[Yy]') { $cfg.Password = ''; $cfg.IsPasswordProtected = $false }
-    }
-
-    try {
-        $desc.ServerDescription_Persistent = $cfg
-        Set-Content -Path $descPath -Value ($desc | ConvertTo-Json -Depth 10) -Force
-        Write-Host ''
-        Write-Host '[OK] Configuration saved.' -ForegroundColor Green
-        Write-Host "  Invite code: $($cfg.InviteCode)"
-        Write-Host "  Start:       $batFile"
-        Write-Host "  Crew joins:  Play > Connect to Server > $($cfg.InviteCode)"
-    } catch {
-        Write-Host "[FAIL] Could not save configuration: $($_.Exception.Message)" -ForegroundColor Red
-    }
-}
-
-# --- Save transfer helpers ---
-
-function Find-ClientWorldFolders {
-    $root   = "$env:LOCALAPPDATA\R5\Saved\SaveProfiles"
-    $worlds = New-Object System.Collections.Generic.List[pscustomobject]
-    if (-not (Test-Path $root)) { return $worlds }
-    Get-ChildItem -Path $root -Filter 'WorldDescription.json' -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-        $wid = Split-Path $_.DirectoryName -Leaf
-        try {
-            $wd = Get-Content $_.FullName -Raw | ConvertFrom-Json
-            $worlds.Add([pscustomobject]@{ WorldId = $wid; WorldName = $wd.WorldDescription.WorldName; Path = $_.DirectoryName; DescFile = $_.FullName; Source = 'client' })
-        } catch {
-            $worlds.Add([pscustomobject]@{ WorldId = $wid; WorldName = '(unreadable)'; Path = $_.DirectoryName; DescFile = $_.FullName; Source = 'client' })
-        }
-    }
-    return $worlds
-}
-
-function Find-ServerWorldFolders {
-    param([string]$ServerPath)
-    $root   = Join-Path $ServerPath $script:ServerSaveRoot
-    $worlds = New-Object System.Collections.Generic.List[pscustomobject]
-    if (-not (Test-Path $root)) { return $worlds }
-    Get-ChildItem -Path $root -Filter 'WorldDescription.json' -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-        $wid = Split-Path $_.DirectoryName -Leaf
-        try {
-            $wd = Get-Content $_.FullName -Raw | ConvertFrom-Json
-            $worlds.Add([pscustomobject]@{ WorldId = $wid; WorldName = $wd.WorldDescription.WorldName; Path = $_.DirectoryName; DescFile = $_.FullName; Source = 'server' })
-        } catch {
-            $worlds.Add([pscustomobject]@{ WorldId = $wid; WorldName = '(unreadable)'; Path = $_.DirectoryName; DescFile = $_.FullName; Source = 'server' })
-        }
-    }
-    return $worlds
-}
-
-function Test-ProcessesStopped {
-    $running = Get-Process | Where-Object { $_.ProcessName -match 'WindroseServer|Windrose|R5' }
-    if ($running) {
-        Write-Host ''
-        Write-Host '[FAIL] These processes are still running:' -ForegroundColor Red
-        foreach ($p in $running) { Write-Host "  $($p.ProcessName) (PID $($p.Id))" }
-        Write-Host ''
-        Write-Host 'Stop the game client AND the dedicated server before transferring saves.'
-        Write-Host 'Transferring while either is running can corrupt your save data.'
-        return $false
-    }
-    return $true
-}
-
-function Test-WorldIdTripleMatch {
-    param([string]$WorldFolderPath, [string]$ServerDescPath = '')
-    $folderId = Split-Path $WorldFolderPath -Leaf
-    $descFile  = Join-Path $WorldFolderPath 'WorldDescription.json'
-    $result    = [pscustomobject]@{
-        FolderId        = $folderId
-        DescIslandId    = $null
-        ServerConfigId  = $null
-        FolderMatchDesc = $false
-        DescMatchConfig = $false
-        AllMatch        = $false
-        Issues          = @()
-    }
-    if (Test-Path $descFile) {
-        try {
-            $wd = Get-Content $descFile -Raw | ConvertFrom-Json
-            $result.DescIslandId    = $wd.WorldDescription.islandId
-            $result.FolderMatchDesc = ($folderId -eq $result.DescIslandId)
-            if (-not $result.FolderMatchDesc) {
-                $result.Issues += "Folder '$folderId' != islandId '$($result.DescIslandId)' in WorldDescription.json"
-            }
-        } catch { $result.Issues += "Could not parse WorldDescription.json: $($_.Exception.Message)" }
-    } else { $result.Issues += "WorldDescription.json not found in $WorldFolderPath" }
-
-    if ($ServerDescPath -and (Test-Path $ServerDescPath)) {
-        try {
-            $sd = Get-Content $ServerDescPath -Raw | ConvertFrom-Json
-            $result.ServerConfigId  = $sd.ServerDescription_Persistent.WorldIslandId
-            $result.DescMatchConfig = ($folderId -eq $result.ServerConfigId)
-            if (-not $result.DescMatchConfig) {
-                $result.Issues += "Folder '$folderId' != WorldIslandId '$($result.ServerConfigId)' in ServerDescription.json"
-            }
-        } catch { $result.Issues += "Could not parse ServerDescription.json: $($_.Exception.Message)" }
-    }
-    $result.AllMatch = ($result.Issues.Count -eq 0)
-    return $result
-}
-
-function New-SaveBackup {
-    param([string]$Path, [string]$Label)
-    $ts        = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
-    $backupDir = Join-Path "$env:USERPROFILE\Desktop\WindroseBackups" "${Label}_${ts}"
-    try {
-        New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
-        Copy-Item -Path $Path -Destination $backupDir -Recurse -Force
-        Write-Host "  [OK] Backup: $backupDir" -ForegroundColor Green
-        return $backupDir
-    } catch {
-        Write-Host "  [FAIL] Backup failed: $($_.Exception.Message)" -ForegroundColor Red
-        return $null
-    }
-}
-
-function Resolve-ServerPath {
-    $serverPaths = @(Find-DedicatedServerInstall)
-    if ($serverPaths.Count -eq 0) {
-        $m = Read-Host 'No server install found. Enter server path (blank to cancel)'
-        if ([string]::IsNullOrWhiteSpace($m) -or -not (Test-Path $m)) { return $null }
-        return $m
-    }
-    if ($serverPaths.Count -eq 1) {
-        Write-Host "  Server: $($serverPaths[0])"
-        return $serverPaths[0]
-    }
-    Write-Host 'Multiple server installs found:'
-    for ($i = 0; $i -lt $serverPaths.Count; $i++) { Write-Host "  $($i+1). $($serverPaths[$i])" }
-    $pick = Read-Host "Which? (1-$($serverPaths.Count))"
-    return $serverPaths[[math]::Max(0,[int]$pick - 1)]
-}
-
-# --- Save transfer ---
-
-function Invoke-SaveTransfer {
-    Write-Host ''
-    Write-Host '--- Save Transfer ---' -ForegroundColor Cyan
-    Write-Host ''
-    Write-Host '  1. Client -> Server  (move your local world to a dedicated server)'
-    Write-Host '  2. Server -> Client  (pull a world back from a dedicated server)'
-    Write-Host '  3. Cancel'
-    Write-Host ''
-    $dir = Read-Host 'Direction (1-3)'
-    if ($dir -eq '3' -or [string]::IsNullOrWhiteSpace($dir)) { return }
-
-    if (-not (Test-ProcessesStopped)) { return }
-
-    $serverPath = Resolve-ServerPath
-    if (-not $serverPath) { return }
-    $serverDescPath = Join-Path $serverPath $script:ServerDescFile
-
-    if ($dir -eq '1') {
-        # --- Client -> Server ---
-        $worlds = @(Find-ClientWorldFolders)
-        if (-not $worlds -or $worlds.Count -eq 0) {
-            Write-Host '[FAIL] No client worlds found.' -ForegroundColor Red
-            Write-Host "  Looked in: $env:LOCALAPPDATA\R5\Saved\SaveProfiles"
-            return
-        }
-        Write-Host ''
-        Write-Host 'Client worlds:'
-        for ($i = 0; $i -lt $worlds.Count; $i++) {
-            Write-Host "  $($i+1). $($worlds[$i].WorldName)  (ID: $($worlds[$i].WorldId))"
-            Write-Host "       $($worlds[$i].Path)"
-        }
-        $pick  = Read-Host "Which world? (1-$($worlds.Count))"
-        $world = $worlds[[math]::Max(0,[int]$pick - 1)]
-
-        $gameVersion = Split-Path (Split-Path $world.Path -Parent) -Leaf
-        $destRoot    = Join-Path $serverPath "$($script:ServerSaveRoot)\$gameVersion\Worlds"
-        $destPath    = Join-Path $destRoot $world.WorldId
-
-        Write-Host ''
-        Write-Host 'Pre-flight:' -ForegroundColor Cyan
-        Write-Host "  World:    $($world.WorldName)"
-        Write-Host "  ID:       $($world.WorldId)"
-        Write-Host "  From:     $($world.Path)"
-        Write-Host "  To:       $destPath"
-        Write-Host ''
-
-        $val = Test-WorldIdTripleMatch -WorldFolderPath $world.Path
-        if ($val.Issues) {
-            Write-Host '[WARN] Source world has ID issues:' -ForegroundColor Yellow
-            foreach ($issue in $val.Issues) { Write-Host "  - $issue" }
-            $c = Read-Host 'Continue anyway? (y/N)'
-            if ($c -notmatch '^[Yy]') { return }
-        } else { Write-Host '[OK] Source IDs consistent.' -ForegroundColor Green }
-
-        if (Test-Path $destPath) {
-            Write-Host "[WARN] Destination already exists: $destPath" -ForegroundColor Yellow
-            $bk = Read-Host 'Back it up and overwrite? (Y/n)'
-            if ($bk -match '^[Nn]') { Write-Host 'Cancelled.'; return }
-            $bkResult = New-SaveBackup -Path $destPath -Label "server_$($world.WorldId)"
-            if (-not $bkResult) { Write-Host 'Backup failed. Aborting.'; return }
-        }
-
-        Write-Host 'Backing up source...'
-        $srcBk = New-SaveBackup -Path $world.Path -Label "client_$($world.WorldId)"
-        if (-not $srcBk) { Write-Host 'Source backup failed. Aborting.'; return }
-
-        $confirm = Read-Host "Copy '$($world.WorldName)' to server? (Y/n)"
-        if ($confirm -match '^[Nn]') { Write-Host 'Cancelled.'; return }
-
-        New-Item -ItemType Directory -Path $destRoot -Force | Out-Null
-        try {
-            Copy-Item -Path $world.Path -Destination $destPath -Recurse -Force
-            Write-Host '[OK] World copied to server.' -ForegroundColor Green
-        } catch {
-            Write-Host "[FAIL] Copy failed: $($_.Exception.Message)" -ForegroundColor Red; return
-        }
-
-        # Update ServerDescription.json
-        if (Test-Path $serverDescPath) {
-            try {
-                $sd  = Get-Content $serverDescPath -Raw | ConvertFrom-Json
-                $old = $sd.ServerDescription_Persistent.WorldIslandId
-                $sd.ServerDescription_Persistent.WorldIslandId = $world.WorldId
-                Set-Content -Path $serverDescPath -Value ($sd | ConvertTo-Json -Depth 10) -Force
-                Write-Host "[OK] ServerDescription.json updated: $old -> $($world.WorldId)" -ForegroundColor Green
-            } catch {
-                Write-Host "[WARN] Could not update ServerDescription.json: $($_.Exception.Message)" -ForegroundColor Yellow
-                Write-Host "  Manually set WorldIslandId to: $($world.WorldId)"
-            }
-        } else {
-            Write-Host "[WARN] ServerDescription.json not found - manually set WorldIslandId to: $($world.WorldId)" -ForegroundColor Yellow
-        }
-
-        Write-Host ''
-        Write-Host 'Post-transfer validation:' -ForegroundColor Cyan
-        $postVal = Test-WorldIdTripleMatch -WorldFolderPath $destPath -ServerDescPath $serverDescPath
-        if ($postVal.AllMatch) {
-            Write-Host '[OK] All IDs match. Transfer successful.' -ForegroundColor Green
-        } else {
-            Write-Host '[WARN] ID mismatch after transfer - fix before starting server:' -ForegroundColor Yellow
-            foreach ($issue in $postVal.Issues) { Write-Host "  - $issue" }
-            Write-Host "  Open: $serverDescPath"
-            Write-Host "  Set WorldIslandId to exactly: $($world.WorldId)"
-        }
-
-    } else {
-        # --- Server -> Client ---
-        $worlds = @(Find-ServerWorldFolders -ServerPath $serverPath)
-        if (-not $worlds -or $worlds.Count -eq 0) {
-            Write-Host '[FAIL] No worlds found on server.' -ForegroundColor Red
-            Write-Host "  Looked in: $(Join-Path $serverPath $script:ServerSaveRoot)"
-            return
-        }
-        Write-Host ''
-        Write-Host 'Server worlds:'
-        for ($i = 0; $i -lt $worlds.Count; $i++) {
-            Write-Host "  $($i+1). $($worlds[$i].WorldName)  (ID: $($worlds[$i].WorldId))"
-            Write-Host "       $($worlds[$i].Path)"
-        }
-        $pick  = Read-Host "Which world? (1-$($worlds.Count))"
-        $world = $worlds[[math]::Max(0,[int]$pick - 1)]
-
-        $profileRoot = "$env:LOCALAPPDATA\R5\Saved\SaveProfiles"
-        $profiles    = @(Get-ChildItem -Path $profileRoot -ErrorAction SilentlyContinue | Where-Object { $_.PSIsContainer })
-        $profile     = $null
-
-        if ($profiles.Count -eq 1) {
-            $profile = $profiles[0].FullName
-        } elseif ($profiles.Count -gt 1) {
-            Write-Host 'Client profiles:'
-            for ($i = 0; $i -lt $profiles.Count; $i++) { Write-Host "  $($i+1). $($profiles[$i].Name)" }
-            $pick    = Read-Host "Which profile? (1-$($profiles.Count))"
-            $profile = $profiles[[math]::Max(0,[int]$pick - 1)].FullName
-        } else {
-            $profile = $profileRoot
-        }
-
-        $versionPart = Split-Path (Split-Path $world.Path -Parent) -Leaf
-        $destRoot    = Join-Path $profile "RocksDB\$versionPart\Worlds"
-        $destPath    = Join-Path $destRoot $world.WorldId
-
-        Write-Host ''
-        Write-Host "From: $($world.Path)"
-        Write-Host "To:   $destPath"
-
-        if (Test-Path $destPath) {
-            Write-Host "[WARN] Destination exists." -ForegroundColor Yellow
-            $bk = Read-Host 'Back it up and overwrite? (Y/n)'
-            if ($bk -match '^[Nn]') { Write-Host 'Cancelled.'; return }
-            $bkResult = New-SaveBackup -Path $destPath -Label "client_$($world.WorldId)"
-            if (-not $bkResult) { Write-Host 'Backup failed. Aborting.'; return }
-        }
-
-        Write-Host 'Backing up source...'
-        $srcBk = New-SaveBackup -Path $world.Path -Label "server_$($world.WorldId)"
-        if (-not $srcBk) { Write-Host 'Source backup failed. Aborting.'; return }
-
-        $confirm = Read-Host "Copy '$($world.WorldName)' to client? (Y/n)"
-        if ($confirm -match '^[Nn]') { Write-Host 'Cancelled.'; return }
-
-        New-Item -ItemType Directory -Path $destRoot -Force | Out-Null
-        try {
-            Copy-Item -Path $world.Path -Destination $destPath -Recurse -Force
-            Write-Host '[OK] World copied to client.' -ForegroundColor Green
-            Write-Host "When starting the game, choose 'local' saves if prompted."
-        } catch {
-            Write-Host "[FAIL] Copy failed: $($_.Exception.Message)" -ForegroundColor Red
-        }
-    }
-}
-
-# --- Config validation ---
-
-function Invoke-ValidateServerConfig {
-    Write-Host ''
-    Write-Host '--- Validate Server Config ---' -ForegroundColor Cyan
-
-    $serverPath = Resolve-ServerPath
-    if (-not $serverPath) { return }
-    $serverDescPath = Join-Path $serverPath $script:ServerDescFile
-
-    if (-not (Test-Path $serverDescPath)) {
-        Write-Host "[FAIL] ServerDescription.json not found: $serverDescPath" -ForegroundColor Red
-        Write-Host '  Start the server once to generate it, then validate.'
-        return
-    }
-
-    try {
-        $sd           = Get-Content $serverDescPath -Raw | ConvertFrom-Json
-        $configuredId = $sd.ServerDescription_Persistent.WorldIslandId
-        Write-Host "  Active WorldIslandId in ServerDescription.json: $configuredId"
-    } catch {
-        Write-Host "[FAIL] Could not read ServerDescription.json: $($_.Exception.Message)" -ForegroundColor Red
-        return
-    }
-
-    $worlds = @(Find-ServerWorldFolders -ServerPath $serverPath)
-    if (-not $worlds -or $worlds.Count -eq 0) {
-        Write-Host '[WARN] No world folders found on server.' -ForegroundColor Yellow
-        Write-Host '  Transfer a world or run the server once to create one.'
-        return
-    }
-
-    Write-Host ''
-    Write-Host "Worlds on server ($($worlds.Count)):" -ForegroundColor Cyan
-    $allOk = $true
-
-    foreach ($world in $worlds) {
-        Write-Host ''
-        Write-Host "  World: $($world.WorldName)  (Folder: $($world.WorldId))"
-        $val = Test-WorldIdTripleMatch -WorldFolderPath $world.Path -ServerDescPath $serverDescPath
-
-        if ($val.FolderMatchDesc) {
-            Write-Host '    [OK  ] Folder name matches islandId in WorldDescription.json' -ForegroundColor Green
-        } else {
-            Write-Host "    [FAIL] Folder '$($val.FolderId)' != islandId '$($val.DescIslandId)'" -ForegroundColor Red
-            $allOk = $false
-        }
-
-        if ($world.WorldId -eq $configuredId) {
-            Write-Host '    [OK  ] This is the ACTIVE world (matches ServerDescription.json WorldIslandId)' -ForegroundColor Green
-        } else {
-            Write-Host "    [INFO] Not the active world (server will load '$configuredId')" -ForegroundColor Gray
-        }
-
-        foreach ($issue in $val.Issues) {
-            Write-Host "    [WARN] $issue" -ForegroundColor Yellow
-            $allOk = $false
-        }
-    }
-
-    # Check configured ID actually exists
-    if (-not ($worlds | Where-Object { $_.WorldId -eq $configuredId })) {
-        Write-Host ''
-        Write-Host "[FAIL] WorldIslandId '$configuredId' does not match any world folder." -ForegroundColor Red
-        Write-Host '  Server will generate a FRESH WORLD on next start.'
-        Write-Host '  Fix: set WorldIslandId in ServerDescription.json to one of the folder names above.'
-        $allOk = $false
-    }
-
-    Write-Host ''
-    if ($allOk) {
-        Write-Host '[OK] All IDs consistent. No mismatch risk.' -ForegroundColor Green
-    } else {
-        Write-Host '[WARN] Mismatches found. Fix before starting server to avoid progress loss.' -ForegroundColor Yellow
-        Write-Host "  File to edit: $serverDescPath"
-        Write-Host '  Rule: folder name == islandId in WorldDescription.json == WorldIslandId in ServerDescription.json'
-        Write-Host '  Do NOT rename world folders - the database uses those IDs as keys.'
-    }
-}
-
-# -------------------------------------------------------------------------------
-# Export and redaction
+# Export
 # -------------------------------------------------------------------------------
 
 function Export-Summary {
     Write-Section "Captain's summary"
     foreach ($item in $script:Summary) {
-        $prefix = switch ($item.Status) { 'PASS' {'[OK  ]'} 'WARN' {'[WARN]'} 'FAIL' {'[FAIL]'} default {'[INFO]'} }
-        Write-Line "$prefix $($item.Check): $($item.Details)"
+        Write-Line ("[{0}] {1}: {2}" -f $item.Status, $item.Check, $item.Details)
     }
 
     $summaryCsv = Join-Path $script:RootOut 'Manifest.csv'
     $script:Summary | Export-Csv -Path $summaryCsv -NoTypeInformation -Force
 
+    # Markdown version for Discord/forum pasting
     $md = New-Object System.Text.StringBuilder
-    [void]$md.AppendLine("# Windrose Captain's Chest - diagnostic report")
+    [void]$md.AppendLine('# Windrose Captain''s Chest - diagnostic report')
     [void]$md.AppendLine('')
-    [void]$md.AppendLine("- **Logged:** $(Get-Date)")
-    [void]$md.AppendLine("- **Ship:** $env:COMPUTERNAME")
-    [void]$md.AppendLine("- **Admin:** $(Test-Admin)")
+    [void]$md.AppendLine(("- **Logged:** {0}" -f (Get-Date)))
+    [void]$md.AppendLine(("- **Ship:** {0}" -f $env:COMPUTERNAME))
+    [void]$md.AppendLine(("- **Captain:** {0}" -f $env:USERNAME))
+    [void]$md.AppendLine(("- **Admin:** {0}" -f (Test-Admin)))
     [void]$md.AppendLine('')
     [void]$md.AppendLine('## Findings')
     [void]$md.AppendLine('')
     [void]$md.AppendLine('| Status | Check | Details |')
     [void]$md.AppendLine('|--------|-------|---------|')
     foreach ($item in $script:Summary) {
-        [void]$md.AppendLine("| $($item.Status) | $($item.Check) | $($item.Details -replace '\|','\|') |")
+        $safeDetails = ($item.Details -replace '\|', '\|')
+        [void]$md.AppendLine(("| {0} | {1} | {2} |" -f $item.Status, $item.Check, $safeDetails))
     }
     Set-Content -Path $script:MarkdownFile -Value $md.ToString() -Force
 
@@ -1426,63 +1922,195 @@ function Export-Summary {
 
     Write-Section 'Chest sealed'
     Write-Line "Folder:   $script:RootOut"
-    Write-Line "Zip:      $zipPath"
+    Write-Line "Report:   $script:ReportFile"
     Write-Line "Markdown: $script:MarkdownFile"
+    Write-Line "Manifest: $summaryCsv"
+    Write-Line "Zip:      $zipPath"
 }
 
+# -------------------------------------------------------------------------------
+# Redaction (safe-to-post version for Discord/forums)
+# -------------------------------------------------------------------------------
+
 function New-RedactedReport {
-    param([string]$InputPath, [string]$OutputPath)
+    <#
+        Takes a path to a full report (.txt or .md) and writes a redacted
+        version next to it with personal/identifying data replaced by
+        <REDACTED> placeholders. Keeps all diagnostic data intact.
+    #>
+    param(
+        [string]$InputPath,
+        [string]$OutputPath
+    )
+
     if (-not (Test-Path $InputPath)) { return $false }
+
     $content = Get-Content $InputPath -Raw
 
-    $content = $content -replace [regex]::Escape($env:COMPUTERNAME), '<REDACTED_HOSTNAME>'
-    $content = $content -replace [regex]::Escape($env:USERNAME),     '<REDACTED_USER>'
-    $content = $content -replace [regex]::Escape($env:USERPROFILE),  'C:\Users\<REDACTED_USER>'
-    $content = $content -replace [regex]::Escape("C:\Users\$env:USERNAME"), 'C:\Users\<REDACTED_USER>'
+    # Build set of values to scrub dynamically from this run's environment
+    $hostname = $env:COMPUTERNAME
+    $username = $env:USERNAME
+    $userPathEscaped = [regex]::Escape("C:\Users\$username")
+    $userHomeEscaped = [regex]::Escape($env:USERPROFILE)
 
+    # --- Specific values (tied to current user/machine) -----------------------
+
+    # Hostname - the most unique identifier
+    if ($hostname) {
+        $content = $content -replace [regex]::Escape($hostname), '<REDACTED_HOSTNAME>'
+    }
+
+    # Username - replace in all forms including file paths
+    if ($username) {
+        $content = $content -replace [regex]::Escape($username), '<REDACTED_USER>'
+    }
+
+    # Full user profile path (in case env var resolves differently)
+    $content = $content -replace $userHomeEscaped, 'C:\Users\<REDACTED_USER>'
+    $content = $content -replace $userPathEscaped, 'C:\Users\<REDACTED_USER>'
+
+    # --- Generic patterns -----------------------------------------------------
+
+    # Public IPv4 - any non-private IPv4 address
+    # Private ranges: 10.x, 172.16-31.x, 192.168.x, 127.x, 169.254.x
+    # Everything else is public. We check carefully to avoid redacting
+    # localhost, subnet masks, metric numbers, etc.
     $content = [regex]::Replace($content, '\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b', {
         param($m)
-        $ip = $m.Value; $parts = $ip.Split('.')
-        foreach ($p in $parts) { if ([int]$p -gt 255) { return $ip } }
+        $ip = $m.Value
+        $parts = $ip.Split('.')
+        # Skip if any octet is >255 (not a real IP - probably a version or subnet mask)
+        foreach ($p in $parts) {
+            if ([int]$p -gt 255) { return $ip }
+        }
         $o1 = [int]$parts[0]; $o2 = [int]$parts[1]
-        if ($o1 -in @(0,10,127) -or
-            ($o1 -eq 169 -and $o2 -eq 254) -or
-            ($o1 -eq 172 -and $o2 -ge 16 -and $o2 -le 31) -or
-            ($o1 -eq 192 -and $o2 -eq 168) -or
-            $o1 -ge 224 -or
-            $ip -in @('1.1.1.1','1.0.0.1','8.8.8.8','8.8.4.4','9.9.9.9')) { return $ip }
+        # Keep: localhost, private networks, link-local, multicast, subnet masks
+        if ($o1 -eq 0) { return $ip }                                    # 0.0.0.0
+        if ($o1 -eq 10) { return $ip }                                   # 10.x private
+        if ($o1 -eq 127) { return $ip }                                  # loopback
+        if ($o1 -eq 169 -and $o2 -eq 254) { return $ip }                 # link-local
+        if ($o1 -eq 172 -and $o2 -ge 16 -and $o2 -le 31) { return $ip }  # 172.16-31 private
+        if ($o1 -eq 192 -and $o2 -eq 168) { return $ip }                 # 192.168 private
+        if ($o1 -ge 224) { return $ip }                                  # multicast/reserved
+        if ($o1 -eq 255) { return $ip }                                  # subnet mask
+        # Well-known public DNS that's not really personal (shows up in hosts/DNS)
+        if ($ip -in @('1.1.1.1','1.0.0.1','8.8.8.8','8.8.4.4','9.9.9.9')) { return $ip }
         return '<REDACTED_PUBLIC_IP>'
     })
 
-    $content = $content -replace 'DHCPv6 Client DUID[\.\s]*:\s*[\w\-]+', 'DHCPv6 Client DUID . . . : <REDACTED_DUID>'
-    $content = $content -replace '\b([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b', '<REDACTED_MAC>'
-    $content = $content -replace 'fe80::[0-9a-fA-F:]+', 'fe80::<REDACTED>'
+    # Local IPv4 - replace 192.168.x.y and 10.x.y.z host portions but keep subnet shape
+    # Keep default gateways recognizable (usually .1 or .254) but redact specific host IPs
+    $content = [regex]::Replace($content, '\b192\.168\.\d{1,3}\.\d{1,3}\b', {
+        param($m)
+        $ip = $m.Value
+        $parts = $ip.Split('.')
+        $last = [int]$parts[3]
+        # Keep .0 (network), .1 (common gateway), .254 (common gateway), .255 (broadcast)
+        if ($last -in @(0, 1, 254, 255)) { return $ip }
+        return "192.168.$($parts[2]).<REDACTED_HOST>"
+    })
 
-    Set-Content -Path $OutputPath -Value ("REDACTED REPORT - safe to share`nGenerated: $(Get-Date)`n`n" + $content) -Force
+    # DHCPv6 DUID - Windows-format includes MAC. IMPORTANT: must run BEFORE the
+    # MAC regex below, otherwise MAC substitutions break the DUID pattern.
+    $content = $content -replace 'DHCPv6 Client DUID[\.\s]*:\s*[\w\-]+', 'DHCPv6 Client DUID . . . . . . . . : <REDACTED_DUID>'
+    $content = $content -replace 'DHCPv6 IAID[\.\s]*:\s*\d+', 'DHCPv6 IAID . . . . . . . . . . . : <REDACTED_IAID>'
+
+    # DHCP lease dates - match Windows' actual format which uses variable dot spacing
+    $content = $content -replace '(Lease (?:Obtained|Expires)[\.\s]*:\s*)[A-Za-z]+,\s*[A-Za-z]+\s+\d+,\s*\d+\s+\d+:\d+:\d+\s*[AP]M', '$1<REDACTED_LEASE_TIME>'
+
+    # MAC addresses - both hyphen and colon forms (must run AFTER DUID scrubbing)
+    $content = $content -replace '\b([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b', '<REDACTED_MAC>'
+
+    # IPv6 - link-local and globals
+    # Link-local fe80::/10 - redact interface ID portion
+    $content = $content -replace 'fe80::[0-9a-fA-F:]+', 'fe80::<REDACTED>'
+    # Any other IPv6 global - full redact (conservative)
+    $content = $content -replace '\b(?:[0-9a-fA-F]{1,4}:){3,7}[0-9a-fA-F]{1,4}\b', {
+        param($m)
+        $v = $m.Value
+        if ($v -match '^(fe80|::1|::)' -or $v -eq '::1') { return $v }
+        return '<REDACTED_IPV6>'
+    }
+
+    # --- File paths - strip drive paths with user folder references -----------
+    # F:\SteamLibrary\... and similar are OK (hardware layout is useful to helpers)
+    # C:\Users\<anyone>\... is not
+    $content = $content -replace '([A-Z]:\\Users\\)[^\\\s]+', '$1<REDACTED_USER>'
+
+    # --- Banner / header ------------------------------------------------------
+    # Add a notice at the top so anyone reading knows this is scrubbed
+    $banner = @"
+===============================================================================
+  REDACTED REPORT - safe to share
+  Personal data (hostname, username, public IP, MAC, etc.) has been replaced
+  with <REDACTED_*> placeholders. Hardware and diagnostic data preserved.
+  Generated: $(Get-Date)
+===============================================================================
+
+"@
+
+    # Only prepend banner to text reports, not markdown (markdown has its own
+    # structure that's cleaner to edit below)
+    if ($OutputPath -match '\.txt$') {
+        $content = $banner + $content
+    } else {
+        # For markdown: insert a warning callout after the title
+        $content = $content -replace '(?m)^(# Windrose Captain.*?\r?\n)', @"
+`$1
+> ⚠️ **Redacted for sharing.** Personal data (hostname, username, public IP, MAC, etc.) has been replaced with `<REDACTED_*>` placeholders. Hardware and diagnostic data preserved.
+
+"@
+    }
+
+    Set-Content -Path $OutputPath -Value $content -Force
     return $true
 }
 
 function Invoke-RedactionFlow {
-    if ($NoRedactPrompt) { return }
-    $create = $Redact
-    if (-not $create) {
+    <#
+        Runs after the normal Export-Summary. Either creates the redacted
+        copy automatically (if -Redact passed), asks the user (default),
+        or skips entirely (if -NoRedactPrompt passed).
+    #>
+
+    $shouldCreate = $false
+
+    if ($NoRedactPrompt) {
+        return
+    } elseif ($Redact) {
+        $shouldCreate = $true
+    } else {
         Write-Host ''
-        $ans = Read-Host 'Create redacted copy for sharing? (Y/n)'
-        $create = ([string]::IsNullOrWhiteSpace($ans) -or $ans -match '^[Yy]')
+        Write-Host 'Redaction option' -ForegroundColor Green
+        Write-Host 'Create a redacted version of the report with personal data scrubbed?'
+        Write-Host 'Useful for posting in Discord or forums when asking for help.'
+        Write-Host 'Strips: hostname, username, public IP, MAC addresses, file paths.'
+        $answer = Read-Host 'Create redacted copy? (Y/n)'
+        if ([string]::IsNullOrWhiteSpace($answer) -or $answer -match '^[Yy]') {
+            $shouldCreate = $true
+        }
     }
-    if (-not $create) { return }
 
-    $okTxt = New-RedactedReport -InputPath $script:ReportFile   -OutputPath (Join-Path $script:RootOut 'CaptainsLog_REDACTED.txt')
-    $okMd  = New-RedactedReport -InputPath $script:MarkdownFile -OutputPath (Join-Path $script:RootOut 'CaptainsLog_REDACTED.md')
+    if (-not $shouldCreate) { return }
 
+    $redactedTxt = Join-Path $script:RootOut 'CaptainsLog_REDACTED.txt'
+    $redactedMd  = Join-Path $script:RootOut 'CaptainsLog_REDACTED.md'
+
+    $okTxt = New-RedactedReport -InputPath $script:ReportFile   -OutputPath $redactedTxt
+    $okMd  = New-RedactedReport -InputPath $script:MarkdownFile -OutputPath $redactedMd
+
+    # Rebuild the zip to include the new redacted files
     $zipPath = "$script:RootOut.zip"
     if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
     Compress-Archive -Path "$script:RootOut\*" -DestinationPath $zipPath -Force
 
-    if ($okTxt -or $okMd) {
-        Write-Host "Redacted copies in: $script:RootOut" -ForegroundColor Green
-        Write-Host 'Share the REDACTED version publicly, not the full log.'
-    }
+    Write-Section 'Redacted versions created'
+    if ($okTxt) { Write-Line "Redacted TXT:  $redactedTxt" }
+    if ($okMd)  { Write-Line "Redacted MD:   $redactedMd" }
+    Write-Line ''
+    Write-Line 'Post the REDACTED version (not CaptainsLog.txt) when sharing publicly.'
+    Write-Line 'Quick review before posting: open it in Notepad and skim for anything'
+    Write-Line 'that looks personal - the regex catches common things but no tool is perfect.'
 }
 
 # -------------------------------------------------------------------------------
@@ -1490,53 +2118,88 @@ function Invoke-RedactionFlow {
 # -------------------------------------------------------------------------------
 
 Show-Banner
-
-$selectedMode = Prompt-Menu
-
-# Shipwright is interactive only - no log file
-if ($selectedMode -eq 'Shipwright') {
-    Invoke-Shipwright
-    if (-not $NoPause) { Read-Host 'Press Enter to dock' }
-    exit 0
-}
-
 Initialize-Output
 
 Write-Line "Windrose Captain's Chest - diagnostic report"
-Write-Line "Logged:  $(Get-Date)"
-Write-Line "Ship:    $env:COMPUTERNAME"
-Write-Line "Admin:   $(Test-Admin)"
-Write-Line "Mode:    $selectedMode"
+Write-Line ("Logged:   {0}" -f (Get-Date))
+Write-Line ("Ship:     {0}" -f $env:COMPUTERNAME)
+Write-Line ("Captain:  {0}" -f $env:USERNAME)
+Write-Line ("Admin:    {0}" -f (Test-Admin))
 
-# Core checks - run in both modes
-Get-PublicIP
+$selectedMode = Prompt-Menu
+
+# Always-run local collection
+Get-OsInfo
+Get-CpuAndMemory
+Get-GpuInfoWithDriverAge
+Test-Seaworthy
 Get-LocalNetworkSummary
+Run-CommandCapture -Label 'Rigging (network adapters)' -Command {
+    Get-NetAdapter | Sort-Object Status, Name |
+        Format-Table -Auto Name, InterfaceDescription, Status, LinkSpeed, MacAddress
+}
 Run-CommandCapture -Label 'IP configuration' -Command { ipconfig /all }
+Run-CommandCapture -Label 'Route table'      -Command { route print }
+
+Get-PublicIP
+
 Test-WindroseServices
-Check-LocalFirewallRules
-Check-HostsFile
+
 Check-SteamAndProcesses
 $installs = Get-GameVersionInfo
 Collect-GameFiles -Installs $installs
+Check-LocalFirewallRules
 Check-RecentErrors
+Check-VCRuntimes
 
-# Mode 2 additions
-if ($selectedMode -eq 'CantReachServer') {
-    $target = Prompt-ServerTarget
-    if (-not [string]::IsNullOrWhiteSpace($target.IP)) {
-        Test-ServerReachability -Target $target.IP -Port $target.Port
-    } else {
-        Add-Finding -Status 'FAIL' -Check 'Server target' -Details 'No IP or hostname provided.'
-        Write-Line 'No target entered. Server reachability tests skipped.'
+Run-CommandCapture -Label 'Hosts file' -Command {
+    Get-Content "$env:WINDIR\System32\drivers\etc\hosts"
+}
+
+# Remote soundings by mode
+switch ($selectedMode) {
+    'Full' {
+        Get-BaselineConnectivity
+        $target = Prompt-ServerTarget
+        if (-not [string]::IsNullOrWhiteSpace($target.IP)) {
+            Write-Section 'Target port'
+            Write-Line ("Sounding: {0}:{1}" -f $target.IP, $target.Port)
+            if ($target.IP -match '[A-Za-z]') { Test-DnsResolution -Target $target.IP }
+            Test-BasicPing -Target $target.IP
+            Test-TcpPort -Target $target.IP -Port $target.Port
+            Test-UdpPortLight
+            Test-WindrosePortPresets -Target $target.IP
+            Run-TraceRoute -Target $target.IP
+        } else {
+            Add-Finding -Status 'FAIL' -Check 'Server target' -Details 'No IP or hostname provided for remote test.'
+            Write-Line 'No target entered. Remote soundings skipped.'
+        }
+    }
+    'Quick' {
+        $target = Prompt-ServerTarget
+        if (-not [string]::IsNullOrWhiteSpace($target.IP)) {
+            Write-Section 'Target port'
+            Write-Line ("Sounding: {0}:{1}" -f $target.IP, $target.Port)
+            Test-TcpPort -Target $target.IP -Port $target.Port
+            Test-UdpPortLight
+        } else {
+            Add-Finding -Status 'FAIL' -Check 'Server target' -Details 'No IP or hostname provided for quick test.'
+            Write-Line 'No target entered. Quick port test skipped.'
+        }
+    }
+    'LocalOnly' {
+        Add-Finding -Status 'PASS' -Check 'Mode' -Details 'Stayed ashore - local-only collection completed.'
+        Write-Line 'Stayed ashore. Remote soundings skipped.'
     }
 }
 
 Export-Summary
+
 Invoke-RedactionFlow
 
 Write-Host ''
 Write-Host "Chest sealed: $script:RootOut.zip" -ForegroundColor Yellow
-Write-Host 'Fair winds, Captain.' -ForegroundColor Yellow
+Write-Host "Fair winds, Captain." -ForegroundColor Yellow
 
 if (-not $NoPause) {
     Write-Host ''

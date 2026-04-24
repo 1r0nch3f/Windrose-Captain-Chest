@@ -8,7 +8,7 @@ REM ============================================================
 
 set "REPO_URL=https://github.com/1r0nch3f/Windrose-Captain-Chest.git"
 set "BRANCH=main"
-set "COMMIT_MSG=Initial commit: Captain's Chest diagnostic toolkit"
+set "COMMIT_MSG="
 
 echo.
 echo ============================================================
@@ -19,6 +19,10 @@ echo   Branch:  %BRANCH%
 echo   Folder:  %CD%
 echo ============================================================
 echo.
+
+REM --- Commit message -------------------------------------------
+set /p COMMIT_MSG="Commit message: "
+if "!COMMIT_MSG!"=="" set "COMMIT_MSG=Update CaptainsChest"
 
 REM --- Check git is installed -----------------------------------
 where git >nul 2>nul
