@@ -50,7 +50,7 @@ REM Build ps2exe command. Notable flags:
 REM   -requireAdmin : embeds manifest so exe prompts UAC on launch
 REM   -noConsole    : OFF (we want console - this is a diagnostic tool)
 REM   -title / -company / etc : metadata shown in file properties
-set "PS2EXE_CMD=Invoke-PS2EXE -inputFile 'CaptainsChest.ps1' -outputFile 'CaptainsChest.exe' -requireAdmin -title 'Windrose Captain''s Chest' -description 'Diagnostic toolkit for Windrose crews' -company '1r0nch3f' -product 'Windrose Captain''s Chest' -copyright '(c) 2026 1r0nch3f' -version '1.0.0.0'"
+set "PS2EXE_CMD=Invoke-PS2EXE -inputFile 'CaptainsChest.ps1' -outputFile 'CaptainsChest.exe' -requireAdmin -title 'Windrose Captain''s Chest' -description 'Diagnostic toolkit for Windrose crews' -company '1r0nch3f' -product 'Windrose Captain''s Chest' -copyright '(c) 2026 1r0nch3f' -version '2.0.0.0'"
 
 REM Add icon if the user dropped one in
 if exist "chest.ico" (

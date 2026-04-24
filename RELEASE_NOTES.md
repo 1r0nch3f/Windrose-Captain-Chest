@@ -1,52 +1,46 @@
-# 🏴‍☠️ Windrose Captain's Chest v1.3.1
+# Windrose Captain's Chest v2.0.0
 
-**Small but useful follow-up.** Adds a Direct IP fallback note to the Fleet check summary so users have an immediate workaround when Windrose Connection Services are unreachable.
+**Complete rebuild.** Hardware diagnostics are gone. Shipwright is in. The tool now does exactly two things: diagnose your connection, and manage your dedicated server.
 
-## 🆕 What's new in v1.3.1
+## What changed
 
-### Direct IP fallback in Fleet check summary
+Captain's Chest has been rebuilt from scratch around the one thing that actually causes Windrose issues: networking.
 
-When the backend path is down or unusable, the report now tells users to switch to Windrose's built-in Direct IP host mode instead of stopping at ISP or DNS guidance.
+Hardware diagnostics are gone entirely. No GPU/CPU/RAM info, no dxdiag, no VCRuntime check, no Seaworthy spec comparison. The tool is faster, shorter, and focused.
 
-Example report text:
+## Three modes
 
-```
-=== Fallback: Direct IP mode ===
+**ConnectionTrouble** (the 90% case)
+ISP detection and culprit matching, full fleet endpoint check (all 8 endpoints, dual DNS), Windows Firewall state, game install and version, file salvage, crash log scan.
 
-Connection Services unreachable? You can host without them.
+**CantReachServer**
+Everything in ConnectionTrouble plus DNS resolution, ping, detailed TCP port test, and traceroute to a target IP.
 
-Host a Game -> Direct IP tab -> port 7777
-Share your public IP with your crew
+**Shipwright**
+Dedicated server setup and save management:
+- **Setup** - finds your game install, copies WindroseServer to a location you choose, warns if you pick a path inside the game folder (per the official docs), runs the server once to generate config, then lets you set name/players/region/password interactively.
+- **Save transfer** - moves worlds between your local game and a dedicated server. Backs up both sides before touching anything. Validates the World ID triple-match after transfer and updates ServerDescription.json automatically.
+- **Validate config** - read-only check of all three World IDs that must match. Tells you if the server is pointing at a world that doesn't exist (which causes it to generate a fresh world on every start).
 
-This bypasses Windrose Connection Services entirely.
-Requires port 7777 to be open on your router (tested above).
-```
+## New: TROUBLESHOOTING.md
 
-### Why this belongs in the tool
+A 22-section manual reference that mirrors every check the script runs. Each section has a plain English explanation of what it's checking and why, the exact PowerShell command to paste, and what good vs bad output looks like. Ends with the full ISP culprit table.
 
-- Captain's Chest already tests port **7777** in its default presets
-- Direct IP mode bypasses the Windrose backend path entirely
-- Users with ISP-level filtering now get a practical workaround in the report itself
+For users who want to run checks individually without downloading or running the script.
 
-## 📥 Quick start
+## Download
 
-1. Download **CaptainsChest-v1.3.1.zip** below
+1. Grab **CaptainsChest-v2.0.0.zip** below
 2. Extract anywhere
-3. Double-click `CaptainsChest.exe` — SmartScreen "More info" → "Run anyway", then UAC → Yes
-4. Pick any mode — Fleet check and ISP detection run in all three
+3. Double-click `CaptainsChest.exe` - SmartScreen "More info" > "Run anyway", then UAC > Yes
 
-### ⚠️ Antivirus note
+## Antivirus note
 
-Same as always — the exe is compiled with `ps2exe`, Windows Defender sometimes flags it as a false positive. Source `.ps1` is in the same zip for inspection.
+Compiled with ps2exe. Windows Defender may flag it as a false positive. Source `.ps1` is in the same zip for inspection.
 
-## 💬 A note on hosting providers
+## See also
 
-If you've wondered "if SurvivalServers / LOW.MS / g-portal can host Rust and Palworld fine, why does Windrose fail?" — the answer is: **they do work fine on those hosts.** The block is on your residential ISP side, not the host's. Dedicated-server hosts run on business-grade connections without consumer router security filters. This release now explains that directly in the report.
+- [Changelog](https://github.com/1r0nch3f/Windrose-Captain-Chest/blob/main/CHANGELOG.md) - full release history
+- [Issues](https://github.com/1r0nch3f/Windrose-Captain-Chest/issues) - report bugs or add your ISP to the culprit table
 
-## 📖 See also
-
-- [Wiki](https://github.com/1r0nch3f/Windrose-Captain-Chest/wiki) — usage guide, troubleshooting
-- [Changelog](https://github.com/1r0nch3f/Windrose-Captain-Chest/blob/main/CHANGELOG.md) — full release history
-- [Issues](https://github.com/1r0nch3f/Windrose-Captain-Chest/issues) — report bugs or add your ISP to the culprit table
-
-Fair winds, Captain. 🏴‍☠️
+Fair winds, Captain.

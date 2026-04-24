@@ -10,7 +10,7 @@ REM ============================================================
 set "REPO=1r0nch3f/Windrose-Captain-Chest"
 set "DIST_DIR=_dist"
 
-set /p VERSION="Enter version tag (example: v1.3.1): "
+set /p VERSION="Enter version tag (example: v2.0.0): "
 if "%VERSION%"=="" (
     echo [ERROR] No version entered.
     echo Aborted.
@@ -119,9 +119,10 @@ echo [5/6] Building distribution zip...
 if exist "%DIST_DIR%" rmdir /s /q "%DIST_DIR%"
 mkdir "%DIST_DIR%"
 
-copy /y "README.md"    "%DIST_DIR%\" >nul
-copy /y "LICENSE"      "%DIST_DIR%\" >nul
-copy /y "CHANGELOG.md" "%DIST_DIR%\" >nul
+copy /y "README.md"          "%DIST_DIR%\" >nul
+copy /y "LICENSE"            "%DIST_DIR%\" >nul
+copy /y "CHANGELOG.md"       "%DIST_DIR%\" >nul
+copy /y "TROUBLESHOOTING.md" "%DIST_DIR%\" >nul
 
 if exist "CaptainsChest.exe" (
     echo       Including CaptainsChest.exe (compiled, one-click)
