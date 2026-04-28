@@ -15,13 +15,13 @@
       - Soundings:      Network adapters, local IP, public IP
       - Hold inventory: Windrose install detection and executable versions
       - Watch posts:    Firewall profile and Steam/Windrose rules
+      - Crow's nest:    Live network profile snapshot (TCP/UDP connections, backend
+                        reachability, UDP P2P pool, Direct IP vs invite code mode,
+                        firewall rule check) - requires Windrose to be running
       - Crew roster:    Steam and Windrose process state
       - Log book:       Recent application and system errors
       - Spyglass:       Optional server reachability (DNS, ping, TCP, trace)
       - Salvage:        Collected Config/SaveProfiles/ServerDescription/logs
-      - Logbook scan:   Parses salvaged R5.log files for "Slow task" warnings
-                        from the server's RocksDB commit pipeline (the cause
-                        of at-sea rubber-banding) and grades severity
 
     Outputs to a timestamped chest on yer Desktop:
       - CaptainsLog.txt           - full human-readable report
@@ -1710,202 +1710,6 @@ function Collect-GameFiles {
     }
 }
 
-function Scan-Logbook {
-    <#
-    Scans salvaged R5.log files for the server's own "Slow task" warnings
-    emitted by R5BLDalAsyncQueue::DetectProblems. These are RocksDB commit
-    transactions taking longer than the server expects, and they are the
-    direct cause of the at-sea rubber-banding/lag pattern reported across
-    every Windrose host (Nitrado, SurvivalServers, LOW.MS, etc).
-
-    Log line format observed in the wild:
-      [2026.04.21-10.01.21:778][510]R5LogBLDalAQ: Warning: [063510]
-        R5BLDalAsyncQueue::DetectProblems [s:1774: 6169: commitT]
-        EXTREMELY slow task. Task was finished in 21698 ms. DebugInfo
-
-    Three severity tiers appear in player logs:
-      - "Slow task"            (typically under 1000 ms)
-      - "quite slow task"      (typically 1000-5000 ms)
-      - "EXTREMELY slow task"  (over 5000 ms, sometimes 20+ seconds)
-
-    We bucket by the actual ms value rather than the qualifier wording, so
-    the tiers stay consistent even if the engine adjusts its thresholds.
-    #>
-
-    Write-Section 'Logbook scan (R5.log slow-task analysis)'
-
-    if (-not (Test-Path $script:LogsOut)) {
-        Write-Line 'No salvage folder present, nothing to scan.'
-        Add-Finding -Status 'INFO' -Check 'Logbook scan' -Details 'No salvaged logs to scan.'
-        return
-    }
-
-    $r5Logs = Get-ChildItem -Path $script:LogsOut -Recurse -Filter 'R5*.log' -ErrorAction SilentlyContinue
-    if (-not $r5Logs) {
-        Write-Line 'No R5.log files were salvaged. Skipping slow-task scan.'
-        Add-Finding -Status 'INFO' -Check 'Logbook scan' -Details 'No R5.log files found in salvage.'
-        return
-    }
-
-    $slowPattern = '(?i)R5LogBLDalAQ.*?slow task\.\s*Task was finished in\s+(\d+)\s*ms'
-
-    $totalMatches  = 0
-    $bucketSlow    = 0  # under 1000 ms
-    $bucketQuite   = 0  # 1000-4999 ms
-    $bucketExtreme = 0  # 5000 ms and up
-    $worstMs       = 0
-    $worstLine     = ''
-    $worstFile     = ''
-    $perFile       = @{}
-
-    foreach ($log in $r5Logs) {
-        $fileMatches = 0
-        $fileWorst   = 0
-        try {
-            $content = Get-Content -Path $log.FullName -ErrorAction Stop
-        } catch {
-            Write-Line ("[skip] Could not read {0}: {1}" -f $log.Name, $_.Exception.Message)
-            continue
-        }
-
-        foreach ($line in $content) {
-            if ($line -match $slowPattern) {
-                $ms = [int]$matches[1]
-                $totalMatches++
-                $fileMatches++
-                if ($ms -ge 5000)      { $bucketExtreme++ }
-                elseif ($ms -ge 1000)  { $bucketQuite++ }
-                else                   { $bucketSlow++ }
-                if ($ms -gt $worstMs) {
-                    $worstMs   = $ms
-                    $worstLine = $line.Trim()
-                    $worstFile = $log.Name
-                }
-                if ($ms -gt $fileWorst) { $fileWorst = $ms }
-            }
-        }
-
-        if ($fileMatches -gt 0) {
-            $perFile[$log.Name] = [pscustomobject]@{
-                Count   = $fileMatches
-                WorstMs = $fileWorst
-            }
-        }
-    }
-
-    Write-Line ("Scanned {0} log file(s) under Salvage." -f $r5Logs.Count)
-    Write-Line ''
-
-    if ($totalMatches -eq 0) {
-        Write-Line 'No slow-task warnings found. The server-side RocksDB commit'
-        Write-Line 'pipeline is keeping up - this rules out the most common cause'
-        Write-Line 'of at-sea rubber-banding on dedicated servers.'
-        Add-Finding -Status 'PASS' -Check 'Logbook scan' -Details 'No R5BLDalAsyncQueue slow-task warnings in salvaged logs.'
-        return
-    }
-
-    Write-Line ('Total slow-task warnings:    {0}' -f $totalMatches)
-    Write-Line ('  Slow (under 1s):           {0}' -f $bucketSlow)
-    Write-Line ('  Quite slow (1-5s):         {0}' -f $bucketQuite)
-    Write-Line ('  EXTREMELY slow (5s+):      {0}' -f $bucketExtreme)
-    Write-Line ('Worst single task:           {0:N0} ms ({1:N1} seconds)' -f $worstMs, ($worstMs / 1000.0))
-    if ($worstFile) { Write-Line ("In file:                     {0}" -f $worstFile) }
-
-    if ($perFile.Count -gt 1) {
-        Write-Line ''
-        Write-Line 'Per-file breakdown:'
-        foreach ($key in ($perFile.Keys | Sort-Object)) {
-            $entry = $perFile[$key]
-            Write-Line ('  {0}: {1} hits, worst {2} ms' -f $key, $entry.Count, $entry.WorstMs)
-        }
-    }
-
-    if ($worstLine) {
-        Write-Line ''
-        Write-Line 'Worst line (truncated to 240 chars):'
-        $sample = if ($worstLine.Length -gt 240) { $worstLine.Substring(0,240) + '...' } else { $worstLine }
-        Write-Line ("  {0}" -f $sample)
-    }
-
-    # Grade severity. Thresholds chosen from observed Steam Discussion logs:
-    # any "EXTREMELY slow" is concerning; multiple, or a worst-case over 10s,
-    # is a clear lag-causing condition.
-    $status  = 'INFO'
-    $details = ''
-
-    if ($bucketExtreme -ge 1 -and ($bucketExtreme -ge 5 -or $worstMs -ge 10000)) {
-        $status  = 'FAIL'
-        $details = "Found $bucketExtreme EXTREMELY slow task(s); worst $([int]($worstMs/1000)) seconds. Server is bottlenecked - expect rubber-banding."
-    } elseif ($bucketExtreme -ge 1) {
-        $status  = 'WARN'
-        $details = "Found $bucketExtreme EXTREMELY slow task(s) in logs; worst $worstMs ms. Some at-sea rubber-banding expected."
-    } elseif ($bucketQuite -ge 1) {
-        $status  = 'INFO'
-        $details = "Found $bucketQuite quite-slow task(s). Server is occasionally bottlenecked; mild lag possible at sea."
-    } else {
-        $status  = 'INFO'
-        $details = "Found $bucketSlow minor slow-task warning(s). Below the threshold for visible rubber-banding."
-    }
-
-    Add-Finding -Status $status -Check 'Logbook scan' -Details $details
-
-    # Plain-English diagnosis and mitigation playbook
-    Write-Line ''
-    Write-Line '--- DIAGNOSIS ---'
-    Write-Line ''
-    Write-Line 'These warnings come from the Windrose server itself flagging that'
-    Write-Line 'its own RocksDB commit transactions are taking too long. When a'
-    Write-Line 'commit blocks during boat movement, the server cannot confirm'
-    Write-Line 'your position in time and snaps you back. That is your rubber-band.'
-    Write-Line ''
-    Write-Line 'There are three contributing factors, in order of impact:'
-    Write-Line '  1. Kraken Express co-op backend routing (acknowledged publicly,'
-    Write-Line '     hotfix shipped 16 Apr 2026, more fixes still in testing).'
-    Write-Line '     Nothing the player can do about this one.'
-    Write-Line '  2. Server-side resource pressure (CPU pegging, slow disk,'
-    Write-Line '     memory bloat over uptime). Fixable.'
-    Write-Line '  3. Network path issues (port 3478 blocks, IPv6 prioritization).'
-    Write-Line '     Caught by the Fleet check above.'
-    Write-Line ''
-
-    if ($status -in @('FAIL','WARN')) {
-        Write-Line '--- MITIGATIONS (in order of effort vs payoff) ---'
-        Write-Line ''
-        Write-Line '  * Restart the server daily. Schedule at 4 AM or off-hours.'
-        Write-Line '    The R5 server process leaks memory in early access; a'
-        Write-Line '    restart resets the clock. Single biggest win.'
-        Write-Line ''
-        Write-Line '  * Match server build to client patch. After every Windrose'
-        Write-Line '    update, update the dedicated server through Steam Update'
-        Write-Line '    BEFORE anyone joins. Version drift breaks worlds.'
-        Write-Line ''
-        Write-Line '  * Run the world off an SSD. RocksDB hates spinning disks.'
-        Write-Line '    See the Seaworthy section for whether your system drive'
-        Write-Line '    is SSD; the server world drive should be too.'
-        Write-Line ''
-        Write-Line '  * Cap the player count at 4. Kraken supports 8 but'
-        Write-Line '    recommends 4 for a reason. Each extra player multiplies'
-        Write-Line '    entity simulation cost and slow-task rate.'
-        Write-Line ''
-        Write-Line '  * Verify CPU headroom on the host. The dedicated server'
-        Write-Line '    pegs 100% CPU at idle on some setups (known issue). If'
-        Write-Line '    nothing else is on the box and you still see this,'
-        Write-Line '    bump CPU allocation or move to a quieter node.'
-        Write-Line ''
-        Write-Line '  * Exclude the R5\Saved folder from real-time AV scanning.'
-        Write-Line '    Defender or third-party AV scanning every commit kills'
-        Write-Line '    write throughput.'
-        Write-Line ''
-        Write-Line '  * Review the Fleet check above. If port 3478 is blocked'
-        Write-Line '    by ISP router security, that compounds the problem by'
-        Write-Line '    forcing fallback paths for P2P signaling.'
-    } else {
-        Write-Line 'Slow-task counts are low. No action needed beyond keeping the'
-        Write-Line 'server build current and running daily restarts as preventive'
-        Write-Line 'maintenance.'
-    }
-}
-
 function Check-LocalFirewallRules {
     Write-Section 'Watch posts (firewall profiles)'
     foreach ($p in (Get-NetFirewallProfile)) {
@@ -1923,6 +1727,271 @@ function Check-LocalFirewallRules {
     } else {
         Write-Line 'No matching Steam/Windrose application filters were found.'
         Add-Finding -Status 'WARN' -Check 'Firewall app rules' -Details 'No Steam/Windrose firewall filters found.'
+    }
+}
+
+function Check-WindroseNetworkProfile {
+    <#
+        Snapshots the live network connections owned by Windrose-Win64-Shipping
+        and compares them against the known-good baseline established from
+        direct observation on a healthy machine.
+
+        Baseline (observed 2025-04):
+          - Process name: Windrose-Win64-Shipping (NOT Windrose.exe)
+          - Backend IPs: 3 x port 443 connections (EU/NA, SEA, CIS regions)
+            These are CloseWait at idle/in-session, Established on host screen.
+          - UDP pool: 12 sockets on ports 57095-57106 (0.0.0.0) for P2P peers
+          - Loopback: internal client/server IPC sockets
+          - Direct IP mode adds: port 7777 loopback + 1 extra UDP socket (~60250)
+
+        Findings:
+          PASS  - game running, backend reachable, UDP pool present
+          WARN  - game running but backend missing or UDP pool smaller than expected
+          INFO  - game not running (cannot snapshot)
+          FAIL  - game running but no backend contacts and no UDP pool at all
+    #>
+
+    Write-Section 'Crow''s nest (live network profile)'
+
+    # Known Windrose backend IPs per region (observed, may rotate within AWS pools)
+    $script:WindroseBackendRegions = @{
+        'EU & NA' = @('3.66.107.109', '3.75.35.235', '3.36.19.254')
+        'SEA'     = @('3.37.92.160',  '3.36.19.254')
+        'CIS'     = @('149.154.64.47')
+    }
+    $allKnownBackendIPs = $script:WindroseBackendRegions.Values | ForEach-Object { $_ } | Sort-Object -Unique
+
+    $wr = Get-Process | Where-Object { $_.Name -match 'Windrose-Win64' } | Select-Object -First 1
+
+    if (-not $wr) {
+        Write-Line 'Windrose is not currently running - network profile skipped.'
+        Write-Line 'For best results, run Captain''s Chest while Windrose is open.'
+        Add-Finding -Status 'INFO' -Check 'Network profile' -Details 'Windrose not running - live network snapshot skipped.'
+        return
+    }
+
+    Write-Line ("Process: {0}  PID: {1}" -f $wr.Name, $wr.Id)
+    Write-Line ''
+
+    # TCP snapshot
+    $tcpConns = Get-NetTCPConnection | Where-Object { $_.OwningProcess -eq $wr.Id }
+    $udpConns = Get-NetUDPEndpoint   | Where-Object { $_.OwningProcess -eq $wr.Id }
+
+    # Print raw TCP
+    Write-Line '--- TCP connections ---'
+    if ($tcpConns) {
+        $tcpConns | Sort-Object State, RemoteAddress |
+            Select-Object LocalPort, RemoteAddress, RemotePort, State |
+            Format-Table -AutoSize | Out-String | ForEach-Object { Write-Line $_.TrimEnd() }
+    } else {
+        Write-Line '[none]'
+    }
+
+    # Print raw UDP
+    Write-Line '--- UDP endpoints ---'
+    if ($udpConns) {
+        $udpConns | Sort-Object LocalPort |
+            Select-Object LocalAddress, LocalPort |
+            Format-Table -AutoSize | Out-String | ForEach-Object { Write-Line $_.TrimEnd() }
+    } else {
+        Write-Line '[none]'
+    }
+
+    Write-Line ''
+    Write-Line '--- Analysis ---'
+
+    # Check 1: Backend connectivity
+    $backendContacts = $tcpConns | Where-Object {
+        $_.RemoteAddress -in $allKnownBackendIPs -and $_.RemotePort -eq 443
+    }
+
+    if ($backendContacts) {
+        $regionHits = foreach ($conn in $backendContacts) {
+            foreach ($region in $script:WindroseBackendRegions.Keys) {
+                if ($conn.RemoteAddress -in $script:WindroseBackendRegions[$region]) {
+                    $region; break
+                }
+            }
+        }
+        $regionHits = $regionHits | Sort-Object -Unique
+        $stateNote  = ($backendContacts | Select-Object -ExpandProperty State | Sort-Object -Unique) -join ', '
+        Write-Line ("Backend: contacted {0} region(s) - {1} ({2})" -f $regionHits.Count, ($regionHits -join ', '), $stateNote)
+        Add-Finding -Status 'PASS' -Check 'Network: backend' -Details ("Windrose contacted {0} connection service region(s): {1}" -f $regionHits.Count, ($regionHits -join ', '))
+    } else {
+        Write-Line 'Backend: no known Windrose connection service IPs detected in TCP connections.'
+        Write-Line '  This may mean:'
+        Write-Line '  - The game is at the main menu and has not yet attempted hosting'
+        Write-Line '  - The connection services are being blocked (ISP or firewall)'
+        Write-Line '  - The backend IPs have rotated (check Fleet check section for probed results)'
+        Add-Finding -Status 'WARN' -Check 'Network: backend' -Details 'No Windrose connection service IPs seen in live TCP snapshot. May indicate blocking or game not yet in hosting state.'
+    }
+
+    # Check 2: UDP pool (P2P readiness)
+    # Windrose opens a sequential block of 12 UDP sockets for P2P peer connections.
+    # The port range shifts each session so we detect any block of 10+ sockets
+    # on 0.0.0.0 owned by the process rather than a hard-coded range.
+    $udpExternal = $udpConns | Where-Object { $_.LocalAddress -eq '0.0.0.0' } |
+        Sort-Object LocalPort
+    $udpPoolCount = ($udpExternal | Measure-Object).Count
+    $udpPortRange = if ($udpPoolCount -gt 0) {
+        "$($udpExternal[0].LocalPort)-$($udpExternal[-1].LocalPort)"
+    } else { 'none' }
+
+    if ($udpPoolCount -ge 10) {
+        Write-Line ("UDP pool: {0} sockets open on ports {1} - healthy" -f $udpPoolCount, $udpPortRange)
+        Add-Finding -Status 'PASS' -Check 'Network: UDP pool' -Details ("$udpPoolCount UDP sockets open ($udpPortRange) - peer connections ready.")
+    } elseif ($udpPoolCount -gt 0) {
+        Write-Line ("UDP pool: only {0} sockets open ({1}) - partial pool" -f $udpPoolCount, $udpPortRange)
+        Write-Line '  Expected at least 10 sequential UDP sockets. Fewer may indicate firewall or ISP blocking UDP.'
+        Add-Finding -Status 'WARN' -Check 'Network: UDP pool' -Details ("Only $udpPoolCount P2P UDP sockets open ($udpPortRange). Possible firewall or ISP UDP blocking.")
+    } else {
+        Write-Line 'UDP pool: no external UDP sockets detected.'
+        Write-Line '  Windrose may not be in a hosting state, or UDP traffic is being blocked entirely.'
+        Add-Finding -Status 'WARN' -Check 'Network: UDP pool' -Details 'No P2P UDP sockets detected. Game may not be hosting, or UDP blocked.'
+    }
+
+    # Check 3: Direct IP mode detection
+    $port7777 = $tcpConns | Where-Object {
+        $_.RemotePort -eq 7777 -or $_.LocalPort -eq 7777
+    }
+    if ($port7777) {
+        Write-Line 'Direct IP mode: port 7777 detected - game is hosting in Direct IP mode.'
+        Write-Line '  Reminder: players need your PUBLIC IP to connect. See Soundings section above.'
+        Add-Finding -Status 'INFO' -Check 'Network: hosting mode' -Details 'Direct IP mode active (port 7777 in use). Ensure port 7777 is open on your router.'
+    } else {
+        Write-Line 'Direct IP mode: port 7777 not detected - game is using invite code / connection services mode.'
+        Add-Finding -Status 'INFO' -Check 'Network: hosting mode' -Details 'Invite code mode (no port 7777 detected). Relies on connection services for peer matching.'
+    }
+
+    # Check 4: Firewall rule for Kraken Express / Windrose
+    $krakenRule = Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue |
+        Where-Object { $_.Program -match 'Windrose|Kraken' }
+    if ($krakenRule) {
+        Write-Line 'Firewall rule: Windrose/Kraken Express application rule found - OK.'
+        Add-Finding -Status 'PASS' -Check 'Network: firewall rule' -Details 'Windrose firewall application rule present.'
+    } else {
+        Write-Line 'Firewall rule: no Windrose or Kraken Express firewall rule found.'
+        Write-Line '  If Windows prompted "Allow Windrose on public/private networks?" and you hit Cancel,'
+        Write-Line '  Direct IP hosting will fail. Fix: Windows Defender Firewall > Allow an app > add Windrose.'
+        Add-Finding -Status 'WARN' -Check 'Network: firewall rule' -Details 'No Windrose firewall application rule. May have cancelled the Windows Security prompt during Direct IP host.'
+    }
+
+    # Check 5: Crew invite message
+    # ServerDescription.json lives at <SteamLib>\steamapps\common\Windrose\R5\ServerDescription.json
+    # Confirmed structure: .ServerDescription_Persistent.InviteCode
+    $inviteCode     = $null
+    $serverDescJson = $null
+
+    $serverDescCandidates = @(
+        "$env:ProgramFiles(x86)\Steam\steamapps\common\Windrose\R5\ServerDescription.json",
+        "$env:ProgramFiles\Steam\steamapps\common\Windrose\R5\ServerDescription.json"
+    )
+    $steamLibs = Get-SteamLibraries
+    foreach ($lib in $steamLibs) {
+        $serverDescCandidates += (Join-Path $lib 'steamapps\common\Windrose\R5\ServerDescription.json')
+    }
+
+    foreach ($candidate in ($serverDescCandidates | Select-Object -Unique)) {
+        if (Test-Path $candidate) {
+            try {
+                $serverDescJson = Get-Content $candidate -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                $inviteCode = $serverDescJson.ServerDescription_Persistent.InviteCode
+                if ($inviteCode) { break }
+            } catch { }
+        }
+    }
+
+    Write-Section 'Send to crew (ready-to-copy invite)'
+
+    $isDirectIP    = $null -ne $port7777
+    $hasPublicIP   = -not [string]::IsNullOrWhiteSpace($script:PublicIP)
+    $hasInviteCode = -not [string]::IsNullOrWhiteSpace($inviteCode)
+
+    # Pull extra server details from the JSON for the invite message
+    $serverName    = if ($serverDescJson) { $serverDescJson.ServerDescription_Persistent.ServerName } else { 'Windrose Server' }
+    $maxPlayers    = if ($serverDescJson) { $serverDescJson.ServerDescription_Persistent.MaxPlayerCount } else { $null }
+    $isPassword    = if ($serverDescJson) { $serverDescJson.ServerDescription_Persistent.IsPasswordProtected } else { $false }
+    $serverPass    = if ($serverDescJson) { $serverDescJson.ServerDescription_Persistent.Password } else { '' }
+    $passwordLine  = if ($isPassword -and -not [string]::IsNullOrWhiteSpace($serverPass)) { "Password: $serverPass" } else { $null }
+    $serverInfo    = if ($maxPlayers) { "$serverName (max $maxPlayers players)" } else { $serverName }
+
+    if ($isDirectIP -and $hasPublicIP) {
+        # Direct IP mode - use public IP
+        Write-Line 'Mode: Direct IP hosting'
+        Write-Line ''
+        Write-Line '*** PUBLIC IP WARNING ***'
+        Write-Line "Your public IP ($($script:PublicIP)) identifies your home internet connection."
+        Write-Line 'Only share it with people you trust. Do not post it publicly in Discord servers,'
+        Write-Line 'forums, or social media. Change it if you move or your ISP resets your connection.'
+        Write-Line ''
+        Write-Line '--- Copy this message (text / iMessage / WhatsApp) ---'
+        Write-Line "Hey! Join my Windrose server: $serverInfo"
+        Write-Line "Direct IP: $($script:PublicIP)"
+        Write-Line "Port: 7777"
+        if ($passwordLine) { Write-Line $passwordLine }
+        Write-Line "In-game: Host a Game > Direct IP tab"
+        Write-Line "See you on deck!"
+        Write-Line ''
+        Write-Line '--- Copy this message (Discord) ---'
+        Write-Line "**Join my Windrose server - $serverInfo!**"
+        Write-Line "In-game: **Host a Game > Direct IP tab**"
+        Write-Line "``IP: $($script:PublicIP)``  ``Port: 7777``"
+        if ($passwordLine) { Write-Line ("``$passwordLine``") }
+        Write-Line "See you on deck!"
+        $passNote = if ($isPassword) { ' (password protected)' } else { '' }
+        Add-Finding -Status 'PASS' -Check 'Crew invite' -Details "Direct IP invite ready. Public IP: $($script:PublicIP) Port: 7777$passNote"
+
+    } elseif (-not $isDirectIP -and $hasInviteCode) {
+        # Invite code mode - code found on disk
+        Write-Line 'Mode: Invite code hosting'
+        Write-Line ''
+        Write-Line '--- Copy this message (text / iMessage / WhatsApp) ---'
+        Write-Line "Hey! Join my Windrose server: $serverInfo"
+        Write-Line "Invite code: $inviteCode"
+        if ($passwordLine) { Write-Line $passwordLine }
+        Write-Line "In-game: Join a Game > Enter Code"
+        Write-Line "See you on deck!"
+        Write-Line ''
+        Write-Line '--- Copy this message (Discord) ---'
+        Write-Line "**Join my Windrose server - $serverInfo!**"
+        Write-Line "Go to **Join a Game > Enter Code** and use:"
+        Write-Line "``$inviteCode``"
+        if ($passwordLine) { Write-Line ("``$passwordLine``") }
+        Write-Line "See you on deck!"
+        $passNote = if ($isPassword) { ' (password protected)' } else { '' }
+        Add-Finding -Status 'PASS' -Check 'Crew invite' -Details "Invite code invite ready. Code: $inviteCode$passNote"
+
+    } elseif (-not $isDirectIP -and -not $hasInviteCode) {
+        # Invite code mode but code not found on disk yet
+        Write-Line 'Mode: Invite code hosting (code not yet found on disk)'
+        Write-Line 'The invite code appears in-game on the Host a Game > Invite Code screen.'
+        Write-Line 'Share this template with your crew and fill in the code manually:'
+        Write-Line ''
+        Write-Line '--- Copy this message (text / iMessage / WhatsApp) ---'
+        Write-Line "Hey! Join my Windrose server"
+        Write-Line "Invite code: [copy from Host a Game screen]"
+        Write-Line "In-game: Join a Game > Enter Code"
+        Write-Line "See you on deck!"
+        Write-Line ''
+        Write-Line '--- Copy this message (Discord) ---'
+        Write-Line "**Join my Windrose server!**"
+        Write-Line "Go to **Join a Game > Enter Code** and use:"
+        Write-Line "``[copy from Host a Game screen]``"
+        Write-Line "See you on deck!"
+        Add-Finding -Status 'INFO' -Check 'Crew invite' -Details 'Invite code template generated. Code not auto-detected - copy from in-game Host screen.'
+
+    } elseif ($isDirectIP -and -not $hasPublicIP) {
+        # Direct IP mode but public IP lookup failed
+        Write-Line 'Mode: Direct IP hosting - but public IP lookup failed.'
+        Write-Line 'Could not auto-detect your public IP. Find it manually at https://whatismyip.com'
+        Write-Line 'then share with your crew:'
+        Write-Line ''
+        Write-Line '--- Copy this message (text / iMessage / WhatsApp) ---'
+        Write-Line "Hey! Join my Windrose server"
+        Write-Line "Direct IP: [your public IP from whatismyip.com]"
+        Write-Line "Port: 7777"
+        Write-Line "See you on deck!"
+        Add-Finding -Status 'WARN' -Check 'Crew invite' -Details 'Direct IP mode active but public IP lookup failed. User must find IP manually.'
     }
 }
 
@@ -2055,6 +2124,30 @@ function New-RedactedReport {
     # Full user profile path (in case env var resolves differently)
     $content = $content -replace $userHomeEscaped, 'C:\Users\<REDACTED_USER>'
     $content = $content -replace $userPathEscaped, 'C:\Users\<REDACTED_USER>'
+
+    # Server password - scrub actual password value from the report
+    $serverDescPaths = @(
+        "$env:ProgramFiles(x86)\Steam\steamapps\common\Windrose\R5\ServerDescription.json"
+        "$env:ProgramFiles\Steam\steamapps\common\Windrose\R5\ServerDescription.json"
+    )
+    try {
+        $steamLibs = Get-SteamLibraries
+        foreach ($lib in $steamLibs) {
+            $serverDescPaths += (Join-Path $lib 'steamapps\common\Windrose\R5\ServerDescription.json')
+        }
+    } catch { }
+    foreach ($sdPath in ($serverDescPaths | Select-Object -Unique)) {
+        if (Test-Path $sdPath) {
+            try {
+                $sdJson = Get-Content $sdPath -Raw | ConvertFrom-Json
+                $sdPass = $sdJson.ServerDescription_Persistent.Password
+                if (-not [string]::IsNullOrWhiteSpace($sdPass)) {
+                    $content = $content -replace [regex]::Escape($sdPass), '<REDACTED_SERVER_PASSWORD>'
+                }
+            } catch { }
+            break
+        }
+    }
 
     # --- Generic patterns -----------------------------------------------------
 
@@ -2235,8 +2328,8 @@ Test-WindroseServices
 Check-SteamAndProcesses
 $installs = Get-GameVersionInfo
 Collect-GameFiles -Installs $installs
-Scan-Logbook
 Check-LocalFirewallRules
+Check-WindroseNetworkProfile
 Check-RecentErrors
 Check-VCRuntimes
 
