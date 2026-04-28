@@ -72,6 +72,24 @@ See you on deck!
 
 Works for both invite code and Direct IP mode. Includes the server password in the message when one is set. Public IP warning included for Direct IP hosts.
 
+### Logbook scan — R5.log slow-task analysis *(new in v2.2.0)*
+Parses every salvaged `R5*.log` file for the `R5BLDalAsyncQueue::DetectProblems` slow-task warnings the dedicated server emits when its RocksDB commit pipeline is bottlenecked. These warnings are the direct cause of the at-sea rubber-banding pattern on dedicated servers, and they're invisible unless someone reads the logs by hand.
+
+- **Three-tier bucketing** by ms value: Slow (under 1s), Quite slow (1 to 5s), EXTREMELY slow (5s and up)
+- Reports total counts, worst single task, per-file breakdown, and the worst offending line (truncated to 240 chars)
+- Prints a plain-English diagnosis and a mitigation playbook (daily restarts, build version matching, SSD requirement, 4-player cap, CPU headroom, AV exclusions for `R5\Saved`) when WARN or FAIL grades trigger
+
+```
+=== Logbook scan (R5.log slow-task analysis) ===
+Scanned 1 log file(s) under Salvage.
+
+Total slow-task warnings:    47
+  Slow (under 1s):           28
+  Quite slow (1-5s):         15
+  EXTREMELY slow (5s+):      4
+Worst single task:           21,698 ms (21.7 seconds)
+```
+
 ### Hold inventory
 - Auto-finds Windrose installs across every Steam library folder
 - Executable versions, salvaged configs, SaveProfiles, ServerDescription.json, logs

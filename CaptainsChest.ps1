@@ -22,6 +22,9 @@
       - Log book:       Recent application and system errors
       - Spyglass:       Optional server reachability (DNS, ping, TCP, trace)
       - Salvage:        Collected Config/SaveProfiles/ServerDescription/logs
+      - Logbook scan:   Parses salvaged R5.log files for "Slow task" warnings
+                        from the server's RocksDB commit pipeline (the cause
+                        of at-sea rubber-banding) and grades severity
 
     Outputs to a timestamped chest on yer Desktop:
       - CaptainsLog.txt           - full human-readable report
@@ -1710,6 +1713,202 @@ function Collect-GameFiles {
     }
 }
 
+function Scan-Logbook {
+    <#
+    Scans salvaged R5.log files for the server's own "Slow task" warnings
+    emitted by R5BLDalAsyncQueue::DetectProblems. These are RocksDB commit
+    transactions taking longer than the server expects, and they are the
+    direct cause of the at-sea rubber-banding/lag pattern reported across
+    every Windrose host (Nitrado, SurvivalServers, LOW.MS, etc).
+
+    Log line format observed in the wild:
+      [2026.04.21-10.01.21:778][510]R5LogBLDalAQ: Warning: [063510]
+        R5BLDalAsyncQueue::DetectProblems [s:1774: 6169: commitT]
+        EXTREMELY slow task. Task was finished in 21698 ms. DebugInfo
+
+    Three severity tiers appear in player logs:
+      - "Slow task"            (typically under 1000 ms)
+      - "quite slow task"      (typically 1000-5000 ms)
+      - "EXTREMELY slow task"  (over 5000 ms, sometimes 20+ seconds)
+
+    Bucketing is by actual ms value rather than the qualifier wording,
+    so the tiers stay consistent if the engine adjusts its thresholds.
+    #>
+
+    Write-Section 'Logbook scan (R5.log slow-task analysis)'
+
+    if (-not (Test-Path $script:LogsOut)) {
+        Write-Line 'No salvage folder present, nothing to scan.'
+        Add-Finding -Status 'INFO' -Check 'Logbook scan' -Details 'No salvaged logs to scan.'
+        return
+    }
+
+    $r5Logs = Get-ChildItem -Path $script:LogsOut -Recurse -Filter 'R5*.log' -ErrorAction SilentlyContinue
+    if (-not $r5Logs) {
+        Write-Line 'No R5.log files were salvaged. Skipping slow-task scan.'
+        Add-Finding -Status 'INFO' -Check 'Logbook scan' -Details 'No R5.log files found in salvage.'
+        return
+    }
+
+    $slowPattern = '(?i)R5LogBLDalAQ.*?slow task\.\s*Task was finished in\s+(\d+)\s*ms'
+
+    $totalMatches  = 0
+    $bucketSlow    = 0  # under 1000 ms
+    $bucketQuite   = 0  # 1000-4999 ms
+    $bucketExtreme = 0  # 5000 ms and up
+    $worstMs       = 0
+    $worstLine     = ''
+    $worstFile     = ''
+    $perFile       = @{}
+
+    foreach ($log in $r5Logs) {
+        $fileMatches = 0
+        $fileWorst   = 0
+        try {
+            $content = Get-Content -Path $log.FullName -ErrorAction Stop
+        } catch {
+            Write-Line ("[skip] Could not read {0}: {1}" -f $log.Name, $_.Exception.Message)
+            continue
+        }
+
+        foreach ($line in $content) {
+            if ($line -match $slowPattern) {
+                $ms = [int]$matches[1]
+                $totalMatches++
+                $fileMatches++
+                if ($ms -ge 5000)      { $bucketExtreme++ }
+                elseif ($ms -ge 1000)  { $bucketQuite++ }
+                else                   { $bucketSlow++ }
+                if ($ms -gt $worstMs) {
+                    $worstMs   = $ms
+                    $worstLine = $line.Trim()
+                    $worstFile = $log.Name
+                }
+                if ($ms -gt $fileWorst) { $fileWorst = $ms }
+            }
+        }
+
+        if ($fileMatches -gt 0) {
+            $perFile[$log.Name] = [pscustomobject]@{
+                Count   = $fileMatches
+                WorstMs = $fileWorst
+            }
+        }
+    }
+
+    Write-Line ("Scanned {0} log file(s) under Salvage." -f $r5Logs.Count)
+    Write-Line ''
+
+    if ($totalMatches -eq 0) {
+        Write-Line 'No slow-task warnings found. The server-side RocksDB commit'
+        Write-Line 'pipeline is keeping up - this rules out the most common cause'
+        Write-Line 'of at-sea rubber-banding on dedicated servers.'
+        Add-Finding -Status 'PASS' -Check 'Logbook scan' -Details 'No R5BLDalAsyncQueue slow-task warnings in salvaged logs.'
+        return
+    }
+
+    Write-Line ('Total slow-task warnings:    {0}' -f $totalMatches)
+    Write-Line ('  Slow (under 1s):           {0}' -f $bucketSlow)
+    Write-Line ('  Quite slow (1-5s):         {0}' -f $bucketQuite)
+    Write-Line ('  EXTREMELY slow (5s+):      {0}' -f $bucketExtreme)
+    Write-Line ('Worst single task:           {0:N0} ms ({1:N1} seconds)' -f $worstMs, ($worstMs / 1000.0))
+    if ($worstFile) { Write-Line ("In file:                     {0}" -f $worstFile) }
+
+    if ($perFile.Count -gt 1) {
+        Write-Line ''
+        Write-Line 'Per-file breakdown:'
+        foreach ($key in ($perFile.Keys | Sort-Object)) {
+            $entry = $perFile[$key]
+            Write-Line ('  {0}: {1} hits, worst {2} ms' -f $key, $entry.Count, $entry.WorstMs)
+        }
+    }
+
+    if ($worstLine) {
+        Write-Line ''
+        Write-Line 'Worst line (truncated to 240 chars):'
+        $sample = if ($worstLine.Length -gt 240) { $worstLine.Substring(0,240) + '...' } else { $worstLine }
+        Write-Line ("  {0}" -f $sample)
+    }
+
+    # Grade severity. Thresholds chosen from observed Steam Discussion logs:
+    # any "EXTREMELY slow" is concerning; multiple, or a worst-case over 10s,
+    # is a clear lag-causing condition.
+    $status  = 'INFO'
+    $details = ''
+
+    if ($bucketExtreme -ge 1 -and ($bucketExtreme -ge 5 -or $worstMs -ge 10000)) {
+        $status  = 'FAIL'
+        $details = "Found $bucketExtreme EXTREMELY slow task(s); worst $([int]($worstMs/1000)) seconds. Server is bottlenecked - expect rubber-banding."
+    } elseif ($bucketExtreme -ge 1) {
+        $status  = 'WARN'
+        $details = "Found $bucketExtreme EXTREMELY slow task(s) in logs; worst $worstMs ms. Some at-sea rubber-banding expected."
+    } elseif ($bucketQuite -ge 1) {
+        $status  = 'INFO'
+        $details = "Found $bucketQuite quite-slow task(s). Server is occasionally bottlenecked; mild lag possible at sea."
+    } else {
+        $status  = 'INFO'
+        $details = "Found $bucketSlow minor slow-task warning(s). Below the threshold for visible rubber-banding."
+    }
+
+    Add-Finding -Status $status -Check 'Logbook scan' -Details $details
+
+    # Plain-English diagnosis and mitigation playbook
+    Write-Line ''
+    Write-Line '--- DIAGNOSIS ---'
+    Write-Line ''
+    Write-Line 'These warnings come from the Windrose server itself flagging that'
+    Write-Line 'its own RocksDB commit transactions are taking too long. When a'
+    Write-Line 'commit blocks during boat movement, the server cannot confirm'
+    Write-Line 'your position in time and snaps you back. That is your rubber-band.'
+    Write-Line ''
+    Write-Line 'There are three contributing factors, in order of impact:'
+    Write-Line '  1. Kraken Express co-op backend routing (acknowledged publicly,'
+    Write-Line '     hotfix shipped 16 Apr 2026, more fixes still in testing).'
+    Write-Line '     Nothing the player can do about this one.'
+    Write-Line '  2. Server-side resource pressure (CPU pegging, slow disk,'
+    Write-Line '     memory bloat over uptime). Fixable.'
+    Write-Line '  3. Network path issues (port 3478 blocks, IPv6 prioritization).'
+    Write-Line '     Caught by the Fleet check above.'
+    Write-Line ''
+
+    if ($status -in @('FAIL','WARN')) {
+        Write-Line '--- MITIGATIONS (in order of effort vs payoff) ---'
+        Write-Line ''
+        Write-Line '  * Restart the server daily. Schedule at 4 AM or off-hours.'
+        Write-Line '    The R5 server process leaks memory in early access; a'
+        Write-Line '    restart resets the clock. Single biggest win.'
+        Write-Line ''
+        Write-Line '  * Match server build to client patch. After every Windrose'
+        Write-Line '    update, update the dedicated server through Steam Update'
+        Write-Line '    BEFORE anyone joins. Version drift breaks worlds.'
+        Write-Line ''
+        Write-Line '  * Run the world off an SSD. RocksDB hates spinning disks.'
+        Write-Line '    See the Seaworthy section for whether your system drive'
+        Write-Line '    is SSD; the server world drive should be too.'
+        Write-Line ''
+        Write-Line '  * Cap the player count at 4. Kraken supports 8 but'
+        Write-Line '    recommends 4 for a reason. Each extra player multiplies'
+        Write-Line '    entity simulation cost and slow-task rate.'
+        Write-Line ''
+        Write-Line '  * Verify CPU headroom on the host. The dedicated server'
+        Write-Line '    pegs 100% CPU at idle on some setups (known issue). If'
+        Write-Line '    nothing else is on the box and you still see this,'
+        Write-Line '    bump CPU allocation or move to a quieter node.'
+        Write-Line ''
+        Write-Line '  * Exclude the R5\Saved folder from real-time AV scanning.'
+        Write-Line '    Defender or third-party AV scanning every commit kills'
+        Write-Line '    write throughput.'
+        Write-Line ''
+        Write-Line '  * Review the Fleet check above. If port 3478 is blocked'
+        Write-Line '    by ISP router security, that compounds the problem by'
+        Write-Line '    forcing fallback paths for P2P signaling.'
+    } else {
+        Write-Line 'Slow-task counts are low. No action needed beyond keeping the'
+        Write-Line 'server build current and running daily restarts as preventive'
+        Write-Line 'maintenance.'
+    }
+}
+
 function Check-LocalFirewallRules {
     Write-Section 'Watch posts (firewall profiles)'
     foreach ($p in (Get-NetFirewallProfile)) {
@@ -2328,6 +2527,7 @@ Test-WindroseServices
 Check-SteamAndProcesses
 $installs = Get-GameVersionInfo
 Collect-GameFiles -Installs $installs
+Scan-Logbook
 Check-LocalFirewallRules
 Check-WindroseNetworkProfile
 Check-RecentErrors

@@ -5,7 +5,44 @@ All notable changes to Windrose Captain's Chest will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.4.0] - 2026-04-24
+## [2.2.0] - 2026-04-28
+
+Logbook scan: parse salvaged R5.log files for the server's own slow-task warnings.
+
+### Added
+
+- **Logbook scan section.** A new report section that runs after Salvage. It parses every salvaged `R5*.log` file for the `R5BLDalAsyncQueue::DetectProblems` slow-task warnings the dedicated server emits when its RocksDB commit pipeline is bottlenecked. These warnings are the direct cause of the at-sea rubber-banding pattern reported across every Windrose host (Nitrado, SurvivalServers, LOW.MS, etc), and they're invisible unless someone goes digging through the logs by hand.
+- **Three-tier severity bucketing** based on actual ms values, so the tiers stay consistent if the engine adjusts its thresholds:
+  - Slow (under 1 second)
+  - Quite slow (1 to 5 seconds)
+  - EXTREMELY slow (5 seconds and up, sometimes 20+)
+- **Per-file breakdown** when more than one log file contains hits, plus the worst single line captured (truncated to 240 chars) so helpers can eyeball the actual offending entry.
+- **Plain-English diagnosis** explaining what the warnings mean (RocksDB commit transactions blocking, server cannot confirm boat positions, snaps player back) and the three contributing factors in order of impact (Kraken backend routing, server-side resource pressure, network path issues).
+- **Mitigation playbook** printed inline when WARN or FAIL grades trigger: daily restarts, build version matching, SSD requirement, 4-player cap, CPU headroom check, AV exclusions for `R5\Saved`, cross-reference to the Fleet check.
+
+### Severity grading
+
+- 0 hits → PASS
+- Only minor "slow" hits → INFO (below visible-rubber-band threshold)
+- Any "quite slow" but no extreme → INFO (mild lag possible)
+- 1 to 4 EXTREMELY slow hits, worst under 10 seconds → WARN
+- 5+ EXTREMELY slow hits, or worst case 10 seconds or more → FAIL
+
+### Background
+
+The warnings come from `R5LogBLDalAQ` and look like:
+
+```
+[2026.04.21-10.01.21:778][510]R5LogBLDalAQ: Warning: [063510]
+  R5BLDalAsyncQueue::DetectProblems [s:1774: 6169: commitT]
+  EXTREMELY slow task. Task was finished in 21698 ms. DebugInfo
+```
+
+A 21-second commit transaction is roughly two orders of magnitude over the engine's expected ceiling. Multiple Steam Discussion threads document exactly this pattern correlating with the boat-rubber-banding symptom, and players have been pointing each other at `R5\Saved\Logs\R5.log` for diagnosis. Captain's Chest already salvaged these logs, but until now the user had to read them manually. The Logbook scan turns that into a one-line summary plus a finding in the Captain's summary.
+
+The case-insensitive regex matches all three observed wordings ("Slow task", "quite slow task", "EXTREMELY slow task") by anchoring on the shared `slow task. Task was finished in N ms` suffix, so the bucketing reflects the actual ms value rather than relying on the qualifier text.
+
+## [2.1.0] - 2026-04-24
 
 Live network profile, crew invite generator, and new standalone CaptainsSignal tool.
 
