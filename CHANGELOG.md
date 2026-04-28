@@ -5,27 +5,42 @@ All notable changes to Windrose Captain's Chest will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.4.0] - 2026-04-24
+## [1.4.0] - 2026-04-28
 
-Live network profile, crew invite generator, and new standalone CaptainsSignal tool.
+Logbook scan: parse salvaged R5.log files for the server's own slow-task warnings.
 
 ### Added
 
-- **Crow's nest - live network profile section** in CaptainsChest. When Windrose is running during a chest run, the report now snapshots the live TCP and UDP connections owned by `Windrose-Win64-Shipping` and analyses them against a known-good baseline:
-  - Backend connectivity check: detects which of the three connection service regions (EU/NA, SEA, CIS) Windrose contacted and in what state
-  - UDP pool check: counts external UDP sockets open for P2P peer connections, with dynamic port range detection (the range shifts each session so hard-coded ranges are not used)
-  - Hosting mode detection: identifies Direct IP mode (port 7777) vs invite code mode
-  - Firewall rule check: catches the case where the user hit Cancel on the Windows Security prompt during Direct IP hosting, which silently breaks hosting
-- **Send to crew - ready-to-copy invite message generator.** After the network profile, the report generates formatted invite messages the host can copy directly into text, iMessage, WhatsApp, or Discord. Covers all four scenarios: invite code with/without password, Direct IP with/without password.
-- **Automatic invite code detection.** The invite code is read directly from `ServerDescription.json` at `<SteamLibrary>\steamapps\common\Windrose\R5\ServerDescription.json`. No need to copy it from the in-game screen. Server name, max players, region, and password also read from the same file.
-- **Public IP warning** included in Direct IP invite messages.
-- **Server password redaction** in redacted report versions. Password replaced with `<REDACTED_SERVER_PASSWORD>`.
-- **CaptainsSignal.ps1** - new standalone lightweight tool. Runs in seconds with no hardware collection. Reads server config, checks the live network, and prints a ready-to-copy crew invite message in colour directly to the terminal.
+- **Logbook scan section.** A new report section that runs after Salvage. It parses every salvaged `R5*.log` file for the `R5BLDalAsyncQueue::DetectProblems` slow-task warnings the dedicated server emits when its RocksDB commit pipeline is bottlenecked. These warnings are the direct cause of the at-sea rubber-banding pattern reported across every Windrose host (Nitrado, SurvivalServers, LOW.MS, etc), and they're invisible unless someone goes digging through the logs by hand.
+- **Three-tier severity bucketing** based on actual ms values, so the tiers stay consistent if the engine adjusts its thresholds:
+  - Slow (under 1 second)
+  - Quite slow (1 to 5 seconds)
+  - EXTREMELY slow (5 seconds and up, sometimes 20+)
+- **Per-file breakdown** when more than one log file contains hits, plus the worst single line captured (truncated to 240 chars) so helpers can eyeball the actual offending entry.
+- **Plain-English diagnosis** explaining what the warnings mean (RocksDB commit transactions blocking, server can't confirm boat positions, snaps player back) and the three contributing factors in order of impact (Kraken backend routing, server-side resource pressure, network path issues).
+- **Mitigation playbook** printed inline when WARN or FAIL grades trigger: daily restarts, build version matching, SSD requirement, 4-player cap, CPU headroom check, AV exclusions for `R5\Saved`, cross-reference to the Fleet check.
 
-### Fixed
+### Severity grading
 
-- **Process name detection.** The actual shipping binary is `Windrose-Win64-Shipping`, not `Windrose`. All network profile checks now use the correct name.
-- **UDP pool port range.** Detection now finds any sequential block of 10+ external UDP sockets owned by the process rather than checking a hard-coded range.
+- 0 hits → PASS
+- Only minor "slow" hits → INFO (below visible-rubber-band threshold)
+- Any "quite slow" but no extreme → INFO (mild lag possible)
+- 1 to 4 EXTREMELY slow hits, worst under 10 seconds → WARN
+- 5+ EXTREMELY slow hits, or worst case 10 seconds or more → FAIL
+
+### Background
+
+The warnings come from `R5LogBLDalAQ` and look like:
+
+```
+[2026.04.21-10.01.21:778][510]R5LogBLDalAQ: Warning: [063510]
+  R5BLDalAsyncQueue::DetectProblems [s:1774: 6169: commitT]
+  EXTREMELY slow task. Task was finished in 21698 ms. DebugInfo
+```
+
+A 21-second commit transaction is roughly two orders of magnitude over the engine's expected ceiling. Multiple Steam Discussion threads document exactly this pattern correlating with the boat-rubber-banding symptom, and players have been pointing each other at `R5\Saved\Logs\R5.log` for diagnosis. Captain's Chest already salvaged these logs, but until now the user had to read them manually. The Logbook scan turns that into a one-line summary plus a finding in the Captain's summary.
+
+The case-insensitive regex matches all three observed wordings ("Slow task", "quite slow task", "EXTREMELY slow task") by anchoring on the shared `slow task. Task was finished in N ms` suffix, so the bucketing reflects the actual ms value rather than relying on the qualifier text.
 
 ## [1.3.1] - 2026-04-19
 
